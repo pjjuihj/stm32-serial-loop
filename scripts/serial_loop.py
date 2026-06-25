@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import logging
 import re
@@ -301,6 +302,106 @@ class ProgressTracker:
         }
 
 
+# === 配置系统 ===
+
+# 默认配置（可通过 --config JSON 文件或 CLI 参数覆盖）
+DEFAULT_CONFIG = {
+    "build_marker": "BUILD:",
+    "heartbeat_prefixes": ["HB", "STATUS", "DBG", "DIAG"],
+    "register_bits": {
+        "en":    {"bit": 0,  "width": 1},
+        "circ":  {"bit": 8,  "width": 1},
+        "minc":  {"bit": 10, "width": 1},
+        "psize": {"bit": 11, "width": 2},
+        "msize": {"bit": 13, "width": 2},
+    },
+    "register_name_pattern": r"(?:DMA_)?CR|SR|CSR|ISR",
+    "issue_rules": [
+        {"field": "h",      "op": "<=", "value": 1, "type": "counter_stopped"},
+        {"field": "c",      "op": "<=", "value": 1, "type": "counter_stopped"},
+        {"field": "*_circ", "op": "==",  "value": 0, "type": "no_circ"},
+    ],
+}
+
+_config = dict(DEFAULT_CONFIG)
+
+
+def _rule_match(value, op: str, threshold) -> bool:
+    """通用规则匹配。支持 ==, !=, <, <=, >, >=。"""
+    try:
+        if op == "==":  return value == threshold
+        if op == "!=":  return value != threshold
+        if op == "<":   return value < threshold
+        if op == "<=":  return value <= threshold
+        if op == ">":   return value > threshold
+        if op == ">=":  return value >= threshold
+    except TypeError:
+        pass
+    return False
+
+
+def _rule_match_field(pattern: str, key: str) -> bool:
+    """字段名通配符匹配。支持 * 和 ?（如 dma_*, *_circ, *_cr_*）。"""
+    if pattern.startswith("*"):
+        return fnmatch.fnmatch(key, pattern)
+    return key == pattern
+
+
+def _validate_config(cfg: dict) -> list[str]:
+    """验证配置格式，返回错误列表。"""
+    errors = []
+    if "heartbeat_prefixes" in cfg and not isinstance(cfg["heartbeat_prefixes"], list):
+        errors.append("heartbeat_prefixes 必须是字符串数组")
+    if "register_bits" in cfg:
+        if not isinstance(cfg["register_bits"], dict):
+            errors.append("register_bits 必须是对象")
+        else:
+            for name, defn in cfg["register_bits"].items():
+                if not isinstance(defn, dict) or "bit" not in defn:
+                    errors.append(f"register_bits.{name} 必须包含 bit 字段")
+    if "issue_rules" in cfg:
+        if not isinstance(cfg["issue_rules"], list):
+            errors.append("issue_rules 必须是数组")
+        else:
+            for i, rule in enumerate(cfg["issue_rules"]):
+                for key in ("field", "op", "value", "type"):
+                    if key not in rule:
+                        errors.append(f"issue_rules[{i}] 缺少 {key} 字段")
+    return errors
+
+
+def load_config(config_path: str = None, cli_overrides: dict = None) -> dict:
+    """加载配置。JSON 文件 + CLI 覆盖。"""
+    global _config
+    _config = dict(DEFAULT_CONFIG)
+    if config_path:
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                file_cfg = json.load(f)
+            errors = _validate_config(file_cfg)
+            if errors:
+                for err in errors:
+                    print(f"⚠️ 配置错误: {err}")
+                print("使用默认配置")
+            else:
+                _config.update(file_cfg)
+                print(f"配置已加载: {config_path}")
+        except json.JSONDecodeError as e:
+            print(f"⚠️ 配置文件 JSON 格式错误: {e}")
+        except Exception as e:
+            print(f"⚠️ 配置加载失败: {e}")
+    if cli_overrides:
+        for k, v in cli_overrides.items():
+            if v is not None:
+                if k == "heartbeat_prefix" and isinstance(v, str):
+                    _config["heartbeat_prefixes"] = [p.strip() for p in v.split(",")]
+                elif k == "build_marker" and isinstance(v, str):
+                    _config["build_marker"] = v
+                else:
+                    _config[k] = v
+    return _config
+
+
 # === 常量 ===
 
 MAX_ERRORS = 100  # 最大错误数
@@ -349,16 +450,24 @@ def _process_line(line_buf: bytearray, start_time: float,
         return None
 
     ts = time.time() - start_time
-    return {
+    entry = {
         "timestamp": round(ts, 3),
         "text": text,
         "values": parse_values(text),
     }
 
+    # 检测编译时间戳（前缀从配置读取）
+    build_marker = _config.get("build_marker", "BUILD:")
+    if text.startswith(build_marker):
+        entry["build_info"] = text[len(build_marker):].strip()
+
+    return entry
+
 
 def collect_data(port: str, baud: int = 115200, duration: float = 10.0,
                  protocol: str = "text", retry_count: int = 3,
-                 filter_keyword: str = None) -> dict:
+                 filter_keyword: str = None, send_cmds: list[str] = None,
+                 send_hex: str = None) -> dict:
     """采集串口数据。
 
     Args:
@@ -368,6 +477,7 @@ def collect_data(port: str, baud: int = 115200, duration: float = 10.0,
         protocol: 协议类型（text/hex/vofa）
         retry_count: 重试次数
         filter_keyword: 过滤关键字
+        send_cmds: 采集前发送的诊断命令列表
 
     Returns:
         采集结果
@@ -387,19 +497,44 @@ def collect_data(port: str, baud: int = 115200, duration: float = 10.0,
             else:
                 return {"success": False, "error": f"无法打开串口: {e}"}
 
+    # 清空串口缓冲区，避免积压数据混入
+    ser.reset_input_buffer()
+    ser.reset_output_buffer()
+
+    # 采集前发送诊断命令
+    if send_cmds:
+        print(f"  发送文本命令: {send_cmds}")
+        for cmd in send_cmds:
+            ser.write((cmd + "\r\n").encode("utf-8"))
+            time.sleep(0.1)
+        time.sleep(0.5)
+
+    # 采集前发送十六进制数据
+    if send_hex:
+        hex_bytes = bytes.fromhex(send_hex.replace(" ", ""))
+        print(f"  发送 HEX: {hex_bytes.hex(' ').upper()}")
+        ser.write(hex_bytes)
+        time.sleep(0.5)
+
     entries = []
     start = time.time()
     line_buf = bytearray()
     error_count = 0
 
+    build_info = None
+
     try:
         while time.time() - start < duration:
-            data = ser.read(1)
+            # 批量读取：一次读所有可用字节，减少 Python 调用开销
+            waiting = ser.in_waiting
+            data = ser.read(waiting if waiting > 0 else 1)
             if not data:
                 if line_buf:
                     entry = _process_line(line_buf, start, filter_keyword)
                     if entry:
                         entries.append(entry)
+                        if entry.get("build_info"):
+                            build_info = entry["build_info"]
                         print(f"[{entry['timestamp']:8.3f}] {entry['text']}")
                     line_buf.clear()
                 continue
@@ -409,6 +544,8 @@ def collect_data(port: str, baud: int = 115200, duration: float = 10.0,
                     entry = _process_line(line_buf, start, filter_keyword)
                     if entry:
                         entries.append(entry)
+                        if entry.get("build_info"):
+                            build_info = entry["build_info"]
                         print(f"[{entry['timestamp']:8.3f}] {entry['text']}")
                     line_buf.clear()
                 elif b == ord("\r"):
@@ -442,10 +579,17 @@ def collect_data(port: str, baud: int = 115200, duration: float = 10.0,
         "values": all_values,
         "value_count": len(all_values),
         "error_count": error_count,
+        "build_info": build_info,
         "timestamp": datetime.now().isoformat(),
     }
 
-    print(f"\n采集完成: {len(entries)} 条数据, {len(all_values)} 个数值")
+    # 输出固件版本确认
+    if build_info:
+        print(f"\n✅ 固件编译时间: {build_info}")
+    else:
+        print(f"\n⚠️ 未检测到 BUILD 时间戳 — 可能是旧固件")
+
+    print(f"采集完成: {len(entries)} 条数据, {len(all_values)} 个数值")
     return result
 
 
@@ -479,6 +623,63 @@ def parse_values(text: str) -> list[float]:
         except ValueError:
             continue
     return values
+
+
+def parse_heartbeat(text: str, prefix: str = None) -> dict | None:
+    """通用心跳解析 — 提取所有 key:value 和 key:0xHEX 对。
+
+    适用于任意嵌入式项目的诊断输出，不限于特定格式。
+    寄存器位定义从配置中读取，可自定义。
+
+    Args:
+        text: 一行串口文本
+        prefix: 心跳行前缀，None 时使用配置中的 heartbeat_prefixes
+
+    Returns:
+        解析结果字典，非心跳行返回 None
+    """
+    cfg = _config
+    prefixes = [prefix] if prefix else cfg.get("heartbeat_prefixes", ["HB"])
+
+    matched_prefix = None
+    for p in prefixes:
+        if text.startswith(p):
+            matched_prefix = p
+            break
+    if not matched_prefix:
+        return None
+
+    result = {"raw": text, "prefix": matched_prefix}
+
+    # 解析所有 key:value 对（支持十进制和十六进制）
+    kv_pattern = r'([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(0x[0-9A-Fa-f]+|-?\d+\.?\d*)'
+    reg_bits = cfg.get("register_bits", {})
+    reg_pattern = cfg.get("register_name_pattern", r"CR|SR")
+
+    for match in re.finditer(kv_pattern, text):
+        key = match.group(1).lower()
+        val_str = match.group(2)
+
+        if val_str.startswith("0x") or val_str.startswith("0X"):
+            val = int(val_str, 16)
+            result[key] = val
+            # 检查是否匹配寄存器名模式，自动解析位域
+            if re.search(reg_pattern, key, re.IGNORECASE):
+                for bit_name, bit_def in reg_bits.items():
+                    bit_pos = bit_def["bit"]
+                    bit_width = bit_def.get("width", 1)
+                    mask = (1 << bit_width) - 1
+                    result[f"{key}_{bit_name}"] = (val >> bit_pos) & mask
+        else:
+            try:
+                result[key] = float(val_str)
+            except ValueError:
+                result[key] = val_str
+
+    if len(result) <= 2:
+        return None
+
+    return result
 
 
 def parse_protocol(data: bytes, protocol: str = "text") -> list[dict]:
@@ -637,6 +838,20 @@ def analyze_data(data: dict, min_val: float = None, max_val: float = None,
     stats_result = analyze_statistics(values)
     result["analysis"]["statistics"] = stats_result
 
+    # 频率分析（零交越检测）
+    freq_result = analyze_frequency(values)
+    result["analysis"]["frequency"] = freq_result
+
+    # ADC 卡值检测
+    stuck_result = analyze_stuck_at(values)
+    result["analysis"]["stuck_at"] = stuck_result
+
+    # 时序分析（如果有时间戳）
+    timestamps = [e["timestamp"] for e in entries if "timestamp" in e]
+    if len(timestamps) >= 3:
+        timing_result = analyze_timing(timestamps)
+        result["analysis"]["timing"] = timing_result
+
     # 问题汇总
     issues = []
     if range_result.get("out_of_range"):
@@ -648,6 +863,81 @@ def analyze_data(data: dict, min_val: float = None, max_val: float = None,
     if expected_interval and result["analysis"].get("continuity", {}).get("discontinuities"):
         issues.extend([{"type": "discontinuity", "index": i["index"], "diff": i["diff"], "expected": i["expected"]}
                        for i in result["analysis"]["continuity"]["discontinuities"]])
+
+    # ADC 卡值问题
+    if stuck_result.get("stuck_count", 0) > 0:
+        for seg in stuck_result["stuck_segments"]:
+            issues.append({
+                "type": "stuck_at",
+                "value": seg["value"],
+                "start": seg["start"],
+                "length": seg["length"],
+                "description": f"ADC 卡在 {seg['value']} 长达 {seg['length']} 个采样点",
+            })
+    if stuck_result.get("missing_codes"):
+        issues.append({
+            "type": "missing_codes",
+            "unique": stuck_result["unique_values"],
+            "total": stuck_result["count"],
+            "description": f"只有 {stuck_result['unique_values']} 种值（共 {stuck_result['count']} 个采样点）— ADC 可能缺码",
+        })
+
+    # 时序间隙问题
+    timing_result = result["analysis"].get("timing", {})
+    if timing_result.get("gap_count", 0) > 0:
+        for gap in timing_result["gaps"][:5]:
+            issues.append({
+                "type": "timing_gap",
+                "index": gap["index"],
+                "interval": gap["interval"],
+                "expected": gap["expected"],
+                "description": f"采样间隙 {gap['interval']*1000:.1f}ms（预期 {gap['expected']*1000:.1f}ms）",
+            })
+
+    # 心跳分析（通用 key:value 解析，规则从配置读取）
+    heartbeats = []
+    for entry in entries:
+        hb = parse_heartbeat(entry["text"])
+        if hb:
+            heartbeats.append(hb)
+
+    if heartbeats:
+        latest = heartbeats[-1]
+        # 提取原始字段（排除内部标记和位域展开）
+        bit_suffixes = tuple(f"_{name}" for name in _config.get("register_bits", {}))
+        fields = {k: v for k, v in latest.items()
+                  if k not in ("raw", "prefix") and not k.endswith(bit_suffixes)}
+        result["analysis"]["heartbeat"] = {
+            "count": len(heartbeats),
+            "latest": latest,
+            "fields": fields,
+        }
+
+        # 使用配置中的 issue_rules 检测问题（支持通配符）
+        for rule in _config.get("issue_rules", []):
+            field_pattern = rule["field"]
+            op = rule["op"]
+            threshold = rule["value"]
+            issue_type = rule["type"]
+
+            matched_keys = [k for k in latest if _rule_match_field(field_pattern, k)]
+            for key in matched_keys:
+                val = latest[key]
+                if _rule_match(val, op, threshold):
+                    issue = {"type": issue_type, "field": key, "value": val}
+                    # 尝试关联寄存器原始值
+                    for suffix in ("_en", "_circ", "_minc", "_psize", "_msize"):
+                        if key.endswith(suffix):
+                            issue["register"] = hex(latest.get(key[:-len(suffix)], 0))
+                            break
+                    issues.append(issue)
+
+    # 无心跳时提示
+    if not heartbeats:
+        result["analysis"]["heartbeat"] = {
+            "count": 0,
+            "hint": f"未检测到心跳格式 — 确认固件输出包含前缀 {_config.get('heartbeat_prefixes', ['HB'])}",
+        }
 
     result["issues"] = issues
     result["issue_count"] = len(issues)
@@ -911,295 +1201,162 @@ def analyze_distribution(values: list[float], bins: int = 10) -> dict:
     }
 
 
-# === 数据问题自动检测 ===
-
-def auto_detect_issues(values: list[float]) -> dict:
-    """自动检测数据问题。
+def analyze_frequency(values: list[float], sample_rate: float = None) -> dict:
+    """零交越频率检测 — 从 ADC 数据估算信号频率。
 
     Args:
-        values: 数值列表
+        values: ADC 数值列表
+        sample_rate: 采样率 (Hz)，None 时从时间戳估算
 
     Returns:
-        检测结果
+        频率分析结果
     """
-    if len(values) < 3:
-        return {"success": False, "error": "数据不足"}
+    if len(values) < 10:
+        return {"error": "数据不足"}
 
-    issues = []
+    mean = sum(values) / len(values)
 
-    # 检测范围问题
-    range_result = analyze_range(values)
-    if range_result.get("out_of_range"):
-        issues.append({
-            "type": "range",
-            "description": "数据超出预期范围",
-            "count": len(range_result["out_of_range"]),
-            "severity": "warning",
-        })
+    # 零交越检测（相对于均值）
+    crossings = []
+    for i in range(1, len(values)):
+        if (values[i-1] < mean and values[i] >= mean) or \
+           (values[i-1] >= mean and values[i] < mean):
+            crossings.append(i)
 
-    # 检测跳变问题
-    jump_result = analyze_jumps(values)
-    if jump_result.get("jumps"):
-        issues.append({
-            "type": "jump",
-            "description": "数据存在异常跳变",
-            "count": len(jump_result["jumps"]),
-            "severity": "error",
-        })
+    if len(crossings) < 2:
+        return {
+            "count": len(values),
+            "crossings": len(crossings),
+            "frequency": 0,
+            "note": "无交越点 — 可能是直流信号或数据不足",
+        }
 
-    # 检测稳定性问题
-    stability_result = analyze_stability(values)
-    if stability_result.get("stability") == "不稳定":
-        issues.append({
-            "type": "stability",
-            "description": "数据不稳定",
-            "std_dev": stability_result.get("mean_std", 0),
-            "severity": "warning",
-        })
+    # 计算平均周期（采样点数）
+    intervals = [crossings[i+1] - crossings[i] for i in range(len(crossings)-1)]
+    avg_period_samples = sum(intervals) / len(intervals)
 
-    # 检测趋势问题
-    trend_result = analyze_trend(values)
-    if trend_result.get("trend") == "下降" and trend_result.get("r_squared", 0) > R_SQUARED_THRESHOLD:
-        issues.append({
-            "type": "trend",
-            "description": "数据持续下降",
-            "slope": trend_result.get("slope", 0),
-            "severity": "warning",
-        })
-
-    # 检测异常值
-    outlier_result = analyze_outliers(values)
-    if outlier_result.get("outliers"):
-        issues.append({
-            "type": "outlier",
-            "description": "数据存在异常值",
-            "count": len(outlier_result["outliers"]),
-            "severity": "warning",
-        })
-
-    # 生成修复建议
-    suggestions = generate_fix_suggestions(issues)
+    # 计算频率
+    frequency = 0
+    if sample_rate and sample_rate > 0:
+        frequency = sample_rate / avg_period_samples
+    else:
+        # 无采样率信息，只输出周期（采样点数）
+        frequency = None
 
     return {
-        "success": True,
-        "issue_count": len(issues),
-        "issues": issues,
-        "suggestions": suggestions,
+        "count": len(values),
+        "crossings": len(crossings),
+        "avg_period_samples": avg_period_samples,
+        "frequency": frequency,
+        "intervals": intervals[:10],
+        "interval_std": (sum((x - avg_period_samples)**2 for x in intervals) / len(intervals)) ** 0.5,
     }
 
 
-def generate_fix_suggestions(issues: list[dict]) -> list[dict]:
-    """生成修复建议。
+def analyze_stuck_at(values: list[float], threshold: int = 5) -> dict:
+    """ADC 卡值检测 — 检测值是否长时间不变。
 
     Args:
-        issues: 问题列表
+        values: ADC 数值列表
+        threshold: 连续相同值的最小数量
 
     Returns:
-        修复建议列表
+        卡值检测结果
     """
-    suggestions = []
+    if len(values) < threshold:
+        return {"error": "数据不足"}
 
-    for issue in issues:
-        if issue["type"] == "range":
-            suggestions.append({
-                "issue": "range",
-                "action": "添加范围检查和限幅处理",
-                "code": "range_check(value, min_val, max_val)",
-                "priority": 1,
-            })
+    # 检测连续相同值
+    stuck_segments = []
+    current_val = values[0]
+    current_start = 0
+    current_count = 1
 
-        elif issue["type"] == "jump":
-            suggestions.append({
-                "issue": "jump",
-                "action": "添加中值滤波",
-                "code": "median_filter(value)",
-                "priority": 2,
-            })
+    for i in range(1, len(values)):
+        if values[i] == current_val:
+            current_count += 1
+        else:
+            if current_count >= threshold:
+                stuck_segments.append({
+                    "value": current_val,
+                    "start": current_start,
+                    "length": current_count,
+                })
+            current_val = values[i]
+            current_start = i
+            current_count = 1
 
-        elif issue["type"] == "stability":
-            suggestions.append({
-                "issue": "stability",
-                "action": "添加滑动平均滤波",
-                "code": "moving_average(value)",
-                "priority": 3,
-            })
-
-        elif issue["type"] == "trend":
-            suggestions.append({
-                "issue": "trend",
-                "action": "检查传感器校准",
-                "code": "检查 ADC 参考电压",
-                "priority": 4,
-            })
-
-        elif issue["type"] == "outlier":
-            suggestions.append({
-                "issue": "outlier",
-                "action": "添加异常值检测",
-                "code": "outlier_detection(value, threshold)",
-                "priority": 2,
-            })
-
-    # 按优先级排序
-    suggestions.sort(key=lambda x: x.get("priority", 99))
-    return suggestions
-
-
-def generate_code_modification(analysis: dict, source_code: str = None) -> dict:
-    """生成代码修改建议。
-
-    Args:
-        analysis: 数据分析结果
-        source_code: 源代码（可选）
-
-    Returns:
-        代码修改建议
-    """
-    issues = analysis.get("issues", [])
-    if not issues:
-        return {"success": False, "error": "没有发现问题"}
-
-    modifications = []
-
-    # 检查范围问题
-    if any(i["type"] == "range" for i in issues):
-        modifications.append({
-            "type": "function_addition",
-            "description": "添加范围检查函数",
-            "function_name": "range_check",
-            "code": generate_range_check_code(),
-            "usage": "float filtered = range_check(raw_value, 0.0, 100.0);",
+    # 检查最后一段
+    if current_count >= threshold:
+        stuck_segments.append({
+            "value": current_val,
+            "start": current_start,
+            "length": current_count,
         })
 
-    # 检查跳变问题
-    if any(i["type"] == "jump" for i in issues):
-        modifications.append({
-            "type": "function_addition",
-            "description": "添加中值滤波函数",
-            "function_name": "median_filter",
-            "code": generate_median_filter_code(),
-            "usage": "float filtered = median_filter(raw_value);",
-        })
-
-    # 检查稳定性问题
-    if any(i["type"] == "stability" for i in issues):
-        modifications.append({
-            "type": "function_addition",
-            "description": "添加滑动平均滤波函数",
-            "function_name": "moving_average",
-            "code": generate_moving_average_code(),
-            "usage": "float filtered = moving_average(raw_value);",
-        })
-
-    # 检查异常值问题
-    if any(i["type"] == "outlier" for i in issues):
-        modifications.append({
-            "type": "function_addition",
-            "description": "添加异常值检测函数",
-            "function_name": "outlier_detection",
-            "code": generate_outlier_detection_code(),
-            "usage": "if (outlier_detection(value, 2.0)) { /* 处理异常值 */ }",
-        })
-
-    # 生成修改指南
-    guide = generate_modification_guide(modifications)
+    # 检测值只有 N 种（ADC 缺码）
+    unique_values = sorted(set(values))
+    unique_ratio = len(unique_values) / len(values)
 
     return {
-        "success": True,
-        "modification_count": len(modifications),
-        "modifications": modifications,
-        "guide": guide,
+        "count": len(values),
+        "stuck_segments": stuck_segments,
+        "stuck_count": len(stuck_segments),
+        "unique_values": len(unique_values),
+        "unique_ratio": unique_ratio,
+        "missing_codes": unique_ratio < 0.01 and len(values) > 100,
     }
 
 
-def generate_outlier_detection_code() -> str:
-    """生成异常值检测代码。"""
-    return '''
-// 异常值检测（Z-score 方法）
-typedef struct {
-    float mean;
-    float std_dev;
-    int count;
-    float sum;
-    float sum_sq;
-} Stats;
-
-void stats_init(Stats *s) {
-    s->mean = 0;
-    s->std_dev = 0;
-    s->count = 0;
-    s->sum = 0;
-    s->sum_sq = 0;
-}
-
-void stats_update(Stats *s, float value) {
-    s->count++;
-    s->sum += value;
-    s->sum_sq += value * value;
-    s->mean = s->sum / s->count;
-    s->std_dev = sqrt(s->sum_sq / s->count - s->mean * s->mean);
-}
-
-int is_outlier(Stats *s, float value, float threshold) {
-    if (s->count < 10) return 0;  // 数据不足
-    float z_score = fabs(value - s->mean) / s->std_dev;
-    return z_score > threshold;
-}
-
-// 使用示例
-// Stats stats;
-// stats_init(&stats);
-// for (int i = 0; i < n; i++) {
-//     stats_update(&stats, values[i]);
-//     if (is_outlier(&stats, values[i], 2.0)) {
-//         // 处理异常值
-//     }
-// }
-'''
-
-
-def generate_modification_guide(modifications: list[dict]) -> str:
-    """生成修改指南。
+def analyze_timing(timestamps: list[float]) -> dict:
+    """时序分析 — 检测采样间隔是否均匀。
 
     Args:
-        modifications: 修改列表
+        timestamps: 时间戳列表（秒）
 
     Returns:
-        修改指南
+        时序分析结果
     """
-    lines = []
+    if len(timestamps) < 3:
+        return {"error": "数据不足"}
 
-    lines.append("# 代码修改指南")
-    lines.append("")
-    lines.append("## 修改步骤")
-    lines.append("")
+    intervals = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1)]
+    # 过滤掉明显异常的间隔（>10x 中位数）
+    sorted_intervals = sorted(intervals)
+    median_interval = sorted_intervals[len(sorted_intervals) // 2]
+    valid_intervals = [x for x in intervals if x < median_interval * 10]
 
-    for i, mod in enumerate(modifications, 1):
-        lines.append(f"### 步骤 {i}: {mod['description']}")
-        lines.append("")
-        lines.append(f"1. 在 main.c 中添加以下函数:")
-        lines.append("")
-        lines.append("```c")
-        lines.append(mod["code"])
-        lines.append("```")
-        lines.append("")
-        lines.append(f"2. 在数据采集处使用:")
-        lines.append("")
-        lines.append("```c")
-        lines.append(mod["usage"])
-        lines.append("```")
-        lines.append("")
+    if not valid_intervals:
+        return {"error": "无有效间隔"}
 
-    lines.append("## 注意事项")
-    lines.append("")
-    lines.append("1. **CubeMX 兼容性**: 将函数添加到 `/* USER CODE BEGIN */` 和 `/* USER CODE END */` 之间，")
-    lines.append("   这样 CubeMX 重新生成代码时不会丢失你的修改。")
-    lines.append("2. 滤波器参数需要根据实际情况调整")
-    lines.append("3. 建议在调试阶段保留原始数据用于对比")
-    lines.append("4. **线程安全**: 使用结构体封装的滤波器可以在 ISR 和主循环中独立使用不同的实例")
-    lines.append("")
+    mean_interval = sum(valid_intervals) / len(valid_intervals)
+    std_interval = (sum((x - mean_interval)**2 for x in valid_intervals) / len(valid_intervals)) ** 0.5
+    cv = std_interval / mean_interval if mean_interval > 0 else 0  # 变异系数
 
-    return "\n".join(lines)
+    # 检测时序间隙（间隔 > 3x 平均值）
+    gaps = []
+    for i, interval in enumerate(intervals):
+        if interval > mean_interval * 3:
+            gaps.append({
+                "index": i,
+                "interval": interval,
+                "expected": mean_interval,
+                "ratio": interval / mean_interval,
+            })
+
+    # 估算采样率
+    sample_rate = 1.0 / mean_interval if mean_interval > 0 else 0
+
+    return {
+        "count": len(timestamps),
+        "mean_interval": mean_interval,
+        "std_interval": std_interval,
+        "cv": cv,
+        "sample_rate": sample_rate,
+        "gaps": gaps[:10],
+        "gap_count": len(gaps),
+        "jitter_ms": std_interval * 1000,
+    }
 
 
 # === 测试验证 ===
@@ -1349,6 +1506,253 @@ def record_error_fix(error: str, fix: str, file: str = None) -> bool:
 
     result = _run_workflow_script(script, args)
     return result.get("success", False)
+
+
+# === 文档读写 ===
+
+def read_markdown_issues(filepath: str) -> list[dict]:
+    """通用 markdown 问题解析器 — 从任意 markdown 文件提取问题条目。
+
+    支持格式:
+      ## 1. 标题
+      ## 标题（无编号）
+      ### 标题
+      **问题：** ...
+      **根本原因：** ... / **Root Cause：** ...
+      **解决方案：** ... / **Fix：** ... / **修复方案：** ...
+
+    Args:
+        filepath: markdown 文件路径
+
+    Returns:
+        问题条目列表 [{number, title, section_text, keywords}]
+    """
+    path = Path(filepath)
+    if not path.exists():
+        return []
+
+    content = path.read_text(encoding="utf-8")
+    issues = []
+
+    # 匹配任意 ## 或 ### 标题
+    heading_pattern = r'^(#{2,3})\s+(?:(\d+)\.\s+)?(.+?)(?:\n|$)'
+    headings = list(re.finditer(heading_pattern, content, re.MULTILINE))
+
+    for i, match in enumerate(headings):
+        level = len(match.group(1))
+        number = int(match.group(2)) if match.group(2) else i + 1
+        title = match.group(3).strip()
+
+        # 跳过非问题标题（如"总结"、"概述"等）
+        skip_keywords = ("总结", "概述", "目录", "附录", "summary", "overview", "toc", "appendix")
+        if any(kw in title.lower() for kw in skip_keywords):
+            continue
+
+        # 提取该条目的正文
+        start = match.end()
+        if i + 1 < len(headings):
+            end = headings[i + 1].start()
+        else:
+            end = len(content)
+        body = content[start:end].strip()
+
+        if len(body) < 20:  # 太短的条目跳过
+            continue
+
+        # 提取关键词（加粗文本中的关键信息）
+        keywords = []
+        for kw_match in re.finditer(r'\*\*(.+?)[:：]\*\*', body):
+            keywords.append(kw_match.group(1).strip())
+
+        issues.append({
+            "number": number,
+            "title": title,
+            "section_text": body[:500],
+            "keywords": keywords,
+        })
+
+    return issues
+
+
+def read_solutions_log(project_dir: str) -> list[dict]:
+    """读取项目文档中的已知问题。
+
+    自动搜索 docs/ 目录下的 solutions-log.md、issues.md、problems.md 等文件。
+
+    Args:
+        project_dir: 项目目录
+
+    Returns:
+        已知问题列表
+    """
+    docs_dir = Path(project_dir) / "docs"
+    if not docs_dir.exists():
+        return []
+
+    # 搜索所有可能的问题文档
+    issue_files = []
+    for name in ("solutions-log.md", "issues.md", "problems.md", "debug-log.md",
+                 "troubleshooting.md", "known-issues.md"):
+        path = docs_dir / name
+        if path.exists():
+            issue_files.append(path)
+
+    # 也搜索 docs/ 下所有 .md 文件中包含 "问题" 或 "issue" 的
+    for md_file in docs_dir.glob("*.md"):
+        if md_file not in issue_files:
+            try:
+                head = md_file.read_text(encoding="utf-8")[:500]
+                if any(kw in head.lower() for kw in ("问题", "issue", "bug", "fix", "solution")):
+                    issue_files.append(md_file)
+            except Exception:
+                continue
+
+    all_issues = []
+    for filepath in issue_files:
+        issues = read_markdown_issues(str(filepath))
+        for issue in issues:
+            issue["source_file"] = filepath.name
+        all_issues.extend(issues)
+
+    return all_issues
+
+
+def read_technical_spec(project_dir: str) -> dict:
+    """读取 technical-spec.md 中的关键配置。
+
+    Args:
+        project_dir: 项目目录
+
+    Returns:
+        技术规范关键信息
+    """
+    spec_path = Path(project_dir) / "docs" / "technical-spec.md"
+    if not spec_path.exists():
+        return {}
+
+    content = spec_path.read_text(encoding="utf-8")
+    result = {"raw_sections": []}
+
+    # 提取已知问题部分
+    known_issues_match = re.search(
+        r'## CubeMX.*?已知问题.*?\n(.*?)(?=\n## |\Z)',
+        content, re.DOTALL | re.IGNORECASE
+    )
+    if known_issues_match:
+        result["known_issues"] = known_issues_match.group(1).strip()
+
+    # 提取 DMA 配置
+    dma_match = re.search(r'\|\s*DMA.*?\|.*?\|.*?\|.*?\|', content)
+    if dma_match:
+        result["dma_config"] = dma_match.group(0).strip()
+
+    return result
+
+
+def check_against_docs(project_dir: str, analysis: dict) -> list[dict]:
+    """将分析结果与文档中的已知问题对比。
+
+    Args:
+        project_dir: 项目目录
+        analysis: 数据分析结果
+
+    Returns:
+        匹配的已知问题
+    """
+    known = read_solutions_log(project_dir)
+    if not known:
+        return []
+
+    matches = []
+    issues = analysis.get("issues", [])
+
+    for issue in issues:
+        issue_type = issue.get("type", "")
+
+        for known_issue in known:
+            title_lower = known_issue["title"].lower()
+            text_lower = known_issue.get("section_text", "").lower()
+            keywords = [k.lower() for k in known_issue.get("keywords", [])]
+            all_text = title_lower + " " + text_lower + " " + " ".join(keywords)
+
+            # DMA 停止问题
+            if issue_type == "counter_stopped" and "dma" in all_text and ("停止" in all_text or "stop" in all_text):
+                matches.append({"issue": issue, "known": known_issue})
+            # CIRC 位问题
+            elif issue_type == "no_circ" and "circ" in all_text:
+                matches.append({"issue": issue, "known": known_issue})
+            # 数据范围异常 + PSIZE/MSIZE
+            elif issue_type == "out_of_range" and ("psize" in all_text or "msize" in all_text):
+                matches.append({"issue": issue, "known": known_issue})
+            # 计数器不递增 + MasterSlaveMode
+            elif issue_type == "counter_stopped" and "masterslavemode" in all_text:
+                matches.append({"issue": issue, "known": known_issue})
+            # 通用匹配：问题类型关键词出现在标题中
+            elif issue_type.replace("_", " ") in title_lower:
+                matches.append({"issue": issue, "known": known_issue})
+
+    return matches
+
+
+def write_debug_log(project_dir: str, iteration: int, analysis: dict,
+                    verify_result: dict = None) -> str:
+    """将调试结果写入日志文件。
+
+    Args:
+        project_dir: 项目目录
+        iteration: 迭代轮次
+        analysis: 数据分析结果
+        verify_result: 验证结果
+
+    Returns:
+        日志文件路径
+    """
+    log_dir = Path(project_dir) / "docs" / "debug_logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f"debug_{timestamp}_iter{iteration}.md"
+
+    lines = [
+        f"# 调试日志 — 第 {iteration} 轮",
+        f"",
+        f"> 时间: {datetime.now().isoformat()}",
+        f"",
+    ]
+
+    # 问题列表
+    if analysis.get("issues"):
+        lines.append("## 发现的问题")
+        lines.append("")
+        for issue in analysis["issues"]:
+            lines.append(f"- **{issue['type']}**: {issue.get('field', '?')}={issue.get('value', '?')}")
+        lines.append("")
+
+    # 统计数据
+    stats = analysis.get("analysis", {}).get("statistics", {})
+    if stats:
+        lines.append("## 统计数据")
+        lines.append("")
+        lines.append(f"| 指标 | 值 |")
+        lines.append(f"|------|-----|")
+        lines.append(f"| 均值 | {stats.get('mean', 0):.2f} |")
+        lines.append(f"| 标准差 | {stats.get('std_dev', 0):.2f} |")
+        lines.append(f"| 最小值 | {stats.get('min', 0):.2f} |")
+        lines.append(f"| 最大值 | {stats.get('max', 0):.2f} |")
+        lines.append("")
+
+    # 验证结果
+    if verify_result:
+        lines.append("## 验证结果")
+        lines.append("")
+        lines.append(f"- 状态: {verify_result.get('status', 'N/A')}")
+        lines.append(f"- 说明: {verify_result.get('description', 'N/A')}")
+        lines.append("")
+
+    content = "\n".join(lines)
+    log_file.write_text(content, encoding="utf-8")
+    print(f"调试日志已写入: {log_file}")
+    return str(log_file)
 
 
 # === 技术规范集成 ===
@@ -2028,113 +2432,6 @@ def generate_batch_report(results: list[dict], output_dir: str = "batch_results"
     return report
 
 
-def generate_adaptive_filter_code() -> str:
-    """生成自适应滤波代码。"""
-    return '''
-// 自适应滤波（LMS 算法）
-typedef struct {
-    float *weights;
-    float *buffer;
-    int order;
-    float mu;  // 步长
-} AdaptiveFilter;
-
-void adaptive_init(AdaptiveFilter *af, int order, float mu) {
-    af->order = order;
-    af->mu = mu;
-    af->weights = (float *)calloc(order, sizeof(float));
-    af->buffer = (float *)calloc(order, sizeof(float));
-}
-
-float adaptive_update(AdaptiveFilter *af, float input, float desired) {
-    // 移位缓冲区
-    for (int i = af->order - 1; i > 0; i--) {
-        af->buffer[i] = af->buffer[i - 1];
-    }
-    af->buffer[0] = input;
-
-    // 计算输出
-    float output = 0;
-    for (int i = 0; i < af->order; i++) {
-        output += af->weights[i] * af->buffer[i];
-    }
-
-    // 计算误差
-    float error = desired - output;
-
-    // 更新权重
-    for (int i = 0; i < af->order; i++) {
-        af->weights[i] += 2 * af->mu * error * af->buffer[i];
-    }
-
-    return output;
-}
-
-// 使用示例
-// AdaptiveFilter af;
-// adaptive_init(&af, 10, 0.01);
-// float filtered = adaptive_update(&af, raw_value, desired_value);
-'''
-
-
-def generate_butterworth_filter_code() -> str:
-    """生成巴特沃斯滤波代码。"""
-    return '''
-// 一阶巴特沃斯低通滤波
-typedef struct {
-    float a;  // 滤波系数
-    float y;  // 上一次输出
-    int initialized;
-} ButterworthFilter;
-
-void butterworth_init(ButterworthFilter *bf, float cutoff_freq, float sample_freq) {
-    float rc = 1.0 / (2 * 3.14159 * cutoff_freq);
-    float dt = 1.0 / sample_freq;
-    bf->a = dt / (rc + dt);
-    bf->y = 0;
-    bf->initialized = 0;
-}
-
-float butterworth_update(ButterworthFilter *bf, float input) {
-    if (!bf->initialized) {
-        bf->y = input;
-        bf->initialized = 1;
-        return input;
-    }
-
-    bf->y = bf->y + bf->a * (input - bf->y);
-    return bf->y;
-}
-
-// 使用示例
-// ButterworthFilter bf;
-// butterworth_init(&bf, 10.0, 100.0);  // 截止频率 10Hz，采样频率 100Hz
-// float filtered = butterworth_update(&bf, raw_value);
-'''
-
-
-def generate_savitzky_golay_code() -> str:
-    """生成 Savitzky-Golay 滤波代码。"""
-    return '''
-// Savitzky-Golay 滤波（5 点二次多项式）
-float savitzky_golay_5(float *buffer) {
-    // 5 点二次多项式系数
-    float coeffs[] = {-3, 12, 17, 12, -3};
-    float sum = 0;
-
-    for (int i = 0; i < 5; i++) {
-        sum += coeffs[i] * buffer[i];
-    }
-
-    return sum / 35.0;
-}
-
-// 使用示例
-// float buffer[5] = {v1, v2, v3, v4, v5};
-// float filtered = savitzky_golay_5(buffer);
-'''
-
-
 def analyze_jumps(values: list[float], threshold: float = None) -> dict:
     """分析数据跳变。"""
     if not values:
@@ -2277,6 +2574,70 @@ def print_analysis_result(result: dict):
         print(f"  标准差: {s['std_dev']:.2f}")
         print(f"  方差: {s['variance']:.2f}")
 
+    # 频率分析
+    if "frequency" in analysis:
+        f = analysis["frequency"]
+        if f.get("frequency") is not None and f["frequency"] > 0:
+            print(f"\n频率分析:")
+            print(f"  检测频率: {f['frequency']:.1f} Hz")
+            print(f"  交越点: {f['crossings']}")
+            print(f"  平均周期: {f['avg_period_samples']:.1f} 采样点")
+            if f.get("interval_std"):
+                print(f"  周期抖动: {f['interval_std']:.2f} 采样点")
+        elif f.get("crossings", 0) == 0:
+            print(f"\n频率分析: 无交越点 — 直流信号或数据不足")
+
+    # ADC 卡值检测
+    if "stuck_at" in analysis:
+        sa = analysis["stuck_at"]
+        if sa.get("stuck_count", 0) > 0:
+            print(f"\n⚠️ ADC 卡值检测:")
+            for seg in sa["stuck_segments"][:5]:
+                print(f"  值 {seg['value']} 持续 {seg['length']} 个采样点 (起始 [{seg['start']}])")
+        if sa.get("missing_codes"):
+            print(f"\n⚠️ ADC 缺码: 只有 {sa['unique_values']} 种值（共 {sa['count']} 个采样点）")
+
+    # 时序分析
+    if "timing" in analysis:
+        t = analysis["timing"]
+        print(f"\n时序分析:")
+        print(f"  平均间隔: {t['mean_interval']*1000:.3f} ms")
+        print(f"  估算采样率: {t['sample_rate']:.1f} Hz")
+        print(f"  抖动: {t['jitter_ms']:.3f} ms")
+        if t.get("gap_count", 0) > 0:
+            print(f"  ⚠️ 时序间隙: {t['gap_count']} 个")
+            for gap in t["gaps"][:3]:
+                print(f"    [{gap['index']}] {gap['interval']*1000:.1f}ms (预期 {gap['expected']*1000:.1f}ms)")
+
+    # 心跳分析（通用输出）
+    if "heartbeat" in analysis:
+        hb = analysis["heartbeat"]
+        latest = hb["latest"]
+        print(f"\n心跳分析 ({latest.get('prefix', '?')}):")
+        print(f"  心跳数: {hb['count']}")
+        if "dma_running" in hb:
+            print(f"  运行状态: {'✅ 运行中' if hb['dma_running'] else '❌ 已停止'}")
+        # 输出所有 key:value 字段
+        for key, val in hb.get("fields", {}).items():
+            if isinstance(val, float) and val == int(val):
+                val = int(val)
+            if isinstance(val, int):
+                if val > 0xFFFF:
+                    print(f"  {key.upper()}: 0x{val:08X}")
+                else:
+                    print(f"  {key.upper()}: {val}")
+            else:
+                print(f"  {key.upper()}: {val}")
+        # 输出寄存器位解析
+        for key in latest:
+            if key.endswith("_en"):
+                base = key[:-3]
+                print(f"  {base.upper()}: 0x{latest.get(base, 0):08X} "
+                      f"(EN={latest.get(f'{base}_en', '?')} "
+                      f"CIRC={latest.get(f'{base}_circ', '?')} "
+                      f"PSIZE={latest.get(f'{base}_psize', '?')} "
+                      f"MSIZE={latest.get(f'{base}_msize', '?')})")
+
     # 问题汇总
     if result.get("issues"):
         print(f"\n⚠️ 发现 {result['issue_count']} 个问题:")
@@ -2287,385 +2648,20 @@ def print_analysis_result(result: dict):
                 print(f"  [{issue['index']}] 数据跳变: {issue['from']:.2f} → {issue['to']:.2f}")
             elif issue["type"] == "discontinuity":
                 print(f"  [{issue['index']}] 数据不连续: 间隔 {issue['diff']:.2f}")
+            elif issue["type"] == "counter_stopped":
+                print(f"  计数器停止: {issue.get('field', '?')}={issue.get('value', '?')}")
+            elif issue["type"] == "no_circ":
+                print(f"  CIRC 未设置: {issue.get('register', '?')}")
+            elif issue["type"] == "stuck_at":
+                print(f"  ADC 卡值: {issue.get('value', '?')} 持续 {issue.get('length', '?')} 点")
+            elif issue["type"] == "missing_codes":
+                print(f"  ADC 缺码: {issue.get('unique', '?')} 种值 / {issue.get('total', '?')} 采样点")
+            elif issue["type"] == "timing_gap":
+                print(f"  时序间隙: [{issue.get('index', '?')}] {issue.get('interval', 0)*1000:.1f}ms")
+            else:
+                print(f"  {issue['type']}: {issue.get('field', '?')}={issue.get('value', '?')}")
     else:
         print(f"\n✅ 未发现明显问题")
-
-
-# === 自动修复代码生成 ===
-
-def generate_fix_code(analysis: dict) -> dict:
-    """根据分析结果生成修复代码。
-
-    Args:
-        analysis: 数据分析结果
-
-    Returns:
-        修复代码
-    """
-    issues = analysis.get("issues", [])
-    if not issues:
-        return {"success": False, "error": "没有发现问题"}
-
-    fixes = []
-
-    # 检查范围异常
-    if any(i["type"] == "out_of_range" for i in issues):
-        fixes.append({
-            "type": "range_check",
-            "description": "添加范围检查和限幅处理",
-            "code": generate_range_check_code(),
-        })
-
-    # 检查数据跳变
-    if any(i["type"] == "jump" for i in issues):
-        fixes.append({
-            "type": "median_filter",
-            "description": "添加中值滤波",
-            "code": generate_median_filter_code(),
-        })
-
-    # 检查数据不连续
-    if any(i["type"] == "discontinuity" for i in issues):
-        fixes.append({
-            "type": "moving_average",
-            "description": "添加滑动平均滤波",
-            "code": generate_moving_average_code(),
-        })
-
-    return {
-        "success": True,
-        "fixes": fixes,
-        "fix_count": len(fixes),
-    }
-
-
-def inject_code_to_source(source_file: str, code: str, marker: str = "USER CODE BEGIN 0") -> dict:
-    """将生成的代码注入到源文件中。
-
-    Args:
-        source_file: 源文件路径
-        code: 要注入的代码
-        marker: CubeMX USER CODE 标记
-
-    Returns:
-        注入结果
-    """
-    try:
-        source_path = Path(source_file)
-        if not source_path.exists():
-            return {"success": False, "error": f"源文件不存在: {source_file}"}
-
-        content = source_path.read_text(encoding="utf-8")
-
-        # 查找 USER CODE 标记
-        begin_marker = f"/* {marker} */"
-        end_marker = marker.replace("BEGIN", "END")
-        end_marker = f"/* {end_marker} */"
-
-        begin_idx = content.find(begin_marker)
-        end_idx = content.find(end_marker)
-
-        if begin_idx == -1 or end_idx == -1:
-            return {"success": False, "error": f"未找到 USER CODE 标记: {marker}"}
-
-        # 检查是否已有相同代码（避免重复注入）
-        insert_pos = begin_idx + len(begin_marker)
-        existing_code = content[insert_pos:end_idx].strip()
-        code_stripped = code.strip()
-
-        # 简单去重：检查函数名是否已存在
-        import re
-        func_names = re.findall(r'(?:void|float|int)\s+(\w+)\s*\(', code)
-        for func_name in func_names:
-            if func_name in existing_code:
-                return {"success": False, "error": f"函数 {func_name} 已存在，跳过注入"}
-
-        # 注入代码
-        new_content = content[:insert_pos] + "\n" + code_stripped + "\n" + content[end_idx:]
-
-        # 备份原文件
-        backup_file = source_path.with_suffix(source_path.suffix + ".bak")
-        source_path.rename(backup_file)
-
-        # 写入新内容
-        source_path.write_text(new_content, encoding="utf-8")
-
-        print(f"代码已注入到: {source_file}")
-        print(f"原文件已备份到: {backup_file}")
-
-        return {"success": True, "source_file": source_file, "backup_file": str(backup_file)}
-
-    except Exception as e:
-        return {"success": False, "error": f"注入失败: {e}"}
-
-
-def generate_range_check_code() -> str:
-    """生成范围检查代码。"""
-    return '''
-// 范围检查和限幅处理
-float range_check(float value, float min_val, float max_val) {
-    if (value < min_val) {
-        return min_val;
-    } else if (value > max_val) {
-        return max_val;
-    }
-    return value;
-}
-
-// 使用示例
-// float filtered = range_check(raw_value, 0.0, 100.0);
-'''
-
-
-def generate_median_filter_code() -> str:
-    """生成中值滤波代码。"""
-    return '''
-// 中值滤波（窗口大小 5）
-#define MEDIAN_FILTER_SIZE 5
-
-typedef struct {
-    float buffer[MEDIAN_FILTER_SIZE];
-    int index;
-} MedianFilter;
-
-void median_filter_init(MedianFilter *mf) {
-    for (int i = 0; i < MEDIAN_FILTER_SIZE; i++) {
-        mf->buffer[i] = 0;
-    }
-    mf->index = 0;
-}
-
-float median_filter_update(MedianFilter *mf, float new_value) {
-    float sorted[MEDIAN_FILTER_SIZE];
-
-    // 更新缓冲区
-    mf->buffer[mf->index] = new_value;
-    mf->index = (mf->index + 1) % MEDIAN_FILTER_SIZE;
-
-    // 排序
-    memcpy(sorted, mf->buffer, sizeof(mf->buffer));
-    for (int i = 0; i < MEDIAN_FILTER_SIZE - 1; i++) {
-        for (int j = i + 1; j < MEDIAN_FILTER_SIZE; j++) {
-            if (sorted[i] > sorted[j]) {
-                float temp = sorted[i];
-                sorted[i] = sorted[j];
-                sorted[j] = temp;
-            }
-        }
-    }
-
-    return sorted[MEDIAN_FILTER_SIZE / 2]; // 返回中值
-}
-
-// 使用示例
-// MedianFilter mf;
-// median_filter_init(&mf);
-// float filtered = median_filter_update(&mf, raw_value);
-'''
-
-
-def generate_moving_average_code() -> str:
-    """生成滑动平均滤波代码。"""
-    return '''
-// 滑动平均滤波（窗口大小 10）
-#define MOVING_AVERAGE_SIZE 10
-
-typedef struct {
-    float buffer[MOVING_AVERAGE_SIZE];
-    int index;
-    float sum;
-} MovingAverage;
-
-void moving_average_init(MovingAverage *ma) {
-    for (int i = 0; i < MOVING_AVERAGE_SIZE; i++) {
-        ma->buffer[i] = 0;
-    }
-    ma->index = 0;
-    ma->sum = 0;
-}
-
-float moving_average_update(MovingAverage *ma, float new_value) {
-    // 更新缓冲区
-    ma->sum -= ma->buffer[ma->index];
-    ma->buffer[ma->index] = new_value;
-    ma->sum += new_value;
-    ma->index = (ma->index + 1) % MOVING_AVERAGE_SIZE;
-
-    return ma->sum / MOVING_AVERAGE_SIZE;
-}
-
-// 使用示例
-// MovingAverage ma;
-// moving_average_init(&ma);
-// float filtered = moving_average_update(&ma, raw_value);
-'''
-
-
-def generate_limit_filter_code() -> str:
-    """生成限幅滤波代码。"""
-    return '''
-// 限幅滤波
-float limit_filter(float new_value, float old_value, float max_delta) {
-    float delta = new_value - old_value;
-    if (delta > max_delta) {
-        return old_value + max_delta;
-    } else if (delta < -max_delta) {
-        return old_value - max_delta;
-    }
-    return new_value;
-}
-
-// 使用示例
-// float filtered = limit_filter(raw_value, last_value, 10.0);
-'''
-
-
-def generate_kalman_filter_code() -> str:
-    """生成卡尔曼滤波代码。"""
-    return '''
-// 卡尔曼滤波
-typedef struct {
-    float q; // 过程噪声协方差
-    float r; // 测量噪声协方差
-    float x; // 估计值
-    float p; // 估计误差协方差
-    float k; // 卡尔曼增益
-} KalmanFilter;
-
-void kalman_init(KalmanFilter *kf, float q, float r, float initial_value) {
-    kf->q = q;
-    kf->r = r;
-    kf->x = initial_value;
-    kf->p = 1.0;
-    kf->k = 0;
-}
-
-float kalman_update(KalmanFilter *kf, float measurement) {
-    // 预测
-    kf->p = kf->p + kf->q;
-
-    // 更新
-    kf->k = kf->p / (kf->p + kf->r);
-    kf->x = kf->x + kf->k * (measurement - kf->x);
-    kf->p = (1 - kf->k) * kf->p;
-
-    return kf->x;
-}
-
-// 使用示例
-// KalmanFilter kf;
-// kalman_init(&kf, 0.01, 0.1, 0.0);
-// float filtered = kalman_update(&kf, raw_value);
-'''
-
-
-def generate_ema_filter_code() -> str:
-    """生成指数移动平均滤波代码。"""
-    return '''
-// 指数移动平均滤波 (EMA)
-typedef struct {
-    float last_value;
-    float alpha;
-    int initialized;
-} EMAFilter;
-
-void ema_filter_init(EMAFilter *ef, float alpha) {
-    ef->last_value = 0;
-    ef->alpha = alpha;
-    ef->initialized = 0;
-}
-
-float ema_filter_update(EMAFilter *ef, float new_value) {
-    if (!ef->initialized) {
-        ef->last_value = new_value;
-        ef->initialized = 1;
-        return new_value;
-    }
-
-    ef->last_value = ef->alpha * new_value + (1 - ef->alpha) * ef->last_value;
-    return ef->last_value;
-}
-
-// 使用示例
-// EMAFilter ef;
-// ema_filter_init(&ef, 0.1);  // alpha 越小，滤波越强
-// float filtered = ema_filter_update(&ef, raw_value);
-'''
-
-
-def generate_weighted_average_code() -> str:
-    """生成加权平均滤波代码。"""
-    return '''
-// 加权平均滤波（窗口大小 5）
-#define WEIGHTED_AVERAGE_SIZE 5
-
-typedef struct {
-    float buffer[WEIGHTED_AVERAGE_SIZE];
-    int index;
-} WeightedAverage;
-
-void weighted_average_init(WeightedAverage *wa) {
-    for (int i = 0; i < WEIGHTED_AVERAGE_SIZE; i++) {
-        wa->buffer[i] = 0;
-    }
-    wa->index = 0;
-}
-
-float weighted_average_update(WeightedAverage *wa, float new_value) {
-    // 更新缓冲区
-    wa->buffer[wa->index] = new_value;
-    wa->index = (wa->index + 1) % WEIGHTED_AVERAGE_SIZE;
-
-    // 加权平均（权重：1, 2, 3, 2, 1）
-    float weights[] = {1, 2, 3, 2, 1};
-    float sum = 0;
-    float weight_sum = 0;
-
-    for (int i = 0; i < WEIGHTED_AVERAGE_SIZE; i++) {
-        int idx = (wa->index + i) % WEIGHTED_AVERAGE_SIZE;
-        sum += wa->buffer[idx] * weights[i];
-        weight_sum += weights[i];
-    }
-
-    return sum / weight_sum;
-}
-
-// 使用示例
-// WeightedAverage wa;
-// weighted_average_init(&wa);
-// float filtered = weighted_average_update(&wa, raw_value);
-'''
-
-
-def generate_combination_filter_code() -> str:
-    """生成组合滤波代码。"""
-    return '''
-// 组合滤波：中值滤波 + 滑动平均
-typedef struct {
-    MedianFilter mf;
-    MovingAverage ma;
-} CombinationFilter;
-
-void combination_filter_init(CombinationFilter *cf) {
-    median_filter_init(&cf->mf);
-    moving_average_init(&cf->ma);
-}
-
-float combination_filter_update(CombinationFilter *cf, float new_value) {
-    // 第一级：中值滤波去除脉冲噪声
-    float median_filtered = median_filter_update(&cf->mf, new_value);
-
-    // 第二级：滑动平均平滑数据
-    float final_filtered = moving_average_update(&cf->ma, median_filtered);
-
-    return final_filtered;
-}
-
-// 使用示例
-// CombinationFilter cf;
-// combination_filter_init(&cf);
-// float filtered = combination_filter_update(&cf, raw_value);
-'''
 
 
 # === 工作流集成 ===
@@ -3366,9 +3362,10 @@ def run_workflow_step(project_dir: str, steps: list[str], port: str = None) -> d
 def auto_loop(port: str, baud: int, project_dir: str, duration: float,
               min_val: float = None, max_val: float = None,
               jump_threshold: float = None, max_iterations: int = 5,
-              reset_method: str = "dtr", retry_on_failure: bool = True,
+              reset_method: str = "dtr", verify_reset: bool = False,
+              retry_on_failure: bool = True,
               timeout: int = 300, retry_delay: float = 2.0,
-              source_file: str = None, auto_inject: bool = False) -> dict:
+              send_cmds: list[str] = None, send_hex: str = None) -> dict:
     """自动闭环调试。
 
     Args:
@@ -3384,17 +3381,11 @@ def auto_loop(port: str, baud: int, project_dir: str, duration: float,
         retry_on_failure: 失败时是否重试
         timeout: 超时时间（秒）
         retry_delay: 重试延迟（秒）
-        source_file: 要注入代码的源文件路径（如 main.c）
-        auto_inject: 是否自动注入修复代码到源文件
 
     Returns:
         闭环调试结果
     """
     print(f"自动闭环调试: 最多 {max_iterations} 轮, 超时 {timeout}s")
-    if auto_inject and source_file:
-        print(f"代码注入: {source_file}")
-    else:
-        print("代码注入: 关闭（仅生成修复代码，需手动添加）")
     print("=" * 60)
 
     # 创建进度跟踪器
@@ -3406,6 +3397,14 @@ def auto_loop(port: str, baud: int, project_dir: str, duration: float,
     results = []
     consecutive_failures = 0
     max_consecutive_failures = MAX_CONSECUTIVE_FAILURES
+
+    # 读取已知问题文档
+    known_issues = read_solutions_log(project_dir)
+    if known_issues:
+        sources = set(k.get("source_file", "?") for k in known_issues)
+        print(f"已读取文档: {', '.join(sources)} — {len(known_issues)} 个已知问题")
+    else:
+        print("未找到问题文档（docs/ 下无 solutions-log.md 等）")
 
     for iteration in range(1, max_iterations + 1):
         # 检查超时
@@ -3422,8 +3421,8 @@ def auto_loop(port: str, baud: int, project_dir: str, duration: float,
 
         try:
             # 步骤 1：数据采集
-            print(f"\n[1/5] 数据采集 ({duration}s)...")
-            data = collect_data(port, baud, duration)
+            print(f"\n[1/4] 数据采集 ({duration}s)...")
+            data = collect_data(port, baud, duration, send_cmds=send_cmds, send_hex=send_hex)
             if not data.get("success"):
                 print(f"数据采集失败: {data.get('error')}")
                 consecutive_failures += 1
@@ -3433,24 +3432,31 @@ def auto_loop(port: str, baud: int, project_dir: str, duration: float,
                     "error": data.get("error"),
                     "consecutive_failures": consecutive_failures,
                 })
-
-                # 检查是否连续失败
                 if consecutive_failures >= max_consecutive_failures:
                     print(f"连续失败 {consecutive_failures} 次，停止调试")
                     break
-
-                # 重试
                 if retry_on_failure:
                     print(f"等待 {retry_delay} 秒后重试...")
                     time.sleep(retry_delay)
                 continue
 
-            # 重置连续失败计数
             consecutive_failures = 0
 
             # 步骤 2：数据分析
-            print(f"\n[2/5] 数据分析...")
+            print(f"\n[2/4] 数据分析...")
             analysis = analyze_data(data, min_val, max_val, jump_threshold)
+
+            # 对比已知问题文档
+            doc_matches = check_against_docs(project_dir, analysis)
+            if doc_matches:
+                print(f"\n📋 匹配到 {len(doc_matches)} 个已知问题:")
+                for m in doc_matches:
+                    src = m['known'].get('source_file', '?')
+                    print(f"  → [{src}] #{m['known']['number']} {m['known']['title']}")
+                analysis["doc_matches"] = doc_matches
+
+            # 写调试日志
+            write_debug_log(project_dir, iteration, analysis)
 
             # 步骤 3：判断是否需要修复
             if not analysis.get("issues"):
@@ -3459,6 +3465,7 @@ def auto_loop(port: str, baud: int, project_dir: str, duration: float,
                     "iteration": iteration,
                     "success": True,
                     "issues": 0,
+                    "verified": True,
                     "data_summary": {
                         "value_count": data.get("value_count", 0),
                         "duration": duration,
@@ -3466,43 +3473,16 @@ def auto_loop(port: str, baud: int, project_dir: str, duration: float,
                 })
                 break
 
-            print(f"\n[3/5] 发现 {analysis['issue_count']} 个问题，生成修复代码...")
-            fix_result = generate_fix_code(analysis)
-            if fix_result.get("success"):
-                print(f"生成了 {fix_result['fix_count']} 个修复代码:")
-                for fix in fix_result["fixes"]:
-                    print(f"  - {fix['description']}")
+            print(f"\n[3/4] 发现 {analysis['issue_count']} 个问题，输出报告...")
+            report = generate_report(data, analysis)
+            print(report)
 
-            # 步骤 4：注入代码（如果启用）
-            inject_result = None
-            if auto_inject and source_file and fix_result.get("success"):
-                print(f"\n[4/5] 注入修复代码到 {source_file}...")
-                for fix in fix_result["fixes"]:
-                    inject_result = inject_code_to_source(source_file, fix["code"])
-                    if not inject_result.get("success"):
-                        print(f"  注入失败: {inject_result.get('error')}")
-                        # 注入失败不阻断流程，继续编译烧录
-                        break
-                    else:
-                        print(f"  注入成功: {fix['type']}")
-            else:
-                print(f"\n[4/5] 跳过代码注入（未启用或无源文件）")
-
-            # 步骤 5：编译烧录
-            print(f"\n[5/5] 编译烧录...")
-            flash_result = compile_and_flash(project_dir, port, reset=True)
-            if flash_result.get("success"):
-                print("编译烧录成功")
-                results.append({
-                    "iteration": iteration,
-                    "success": True,
-                    "issues": analysis["issue_count"],
-                    "flash": True,
-                    "reset": flash_result.get("reset", {}),
-                    "fixes": fix_result.get("fixes", []),
-                    "inject": inject_result,
-                })
-            else:
+            # 步骤 3：编译烧录
+            print(f"\n[3/4] 编译烧录...")
+            flash_result = compile_and_flash(project_dir, port, reset=True,
+                                              reset_method=reset_method,
+                                              verify_reset=verify_reset)
+            if not flash_result.get("success"):
                 print(f"编译烧录失败: {flash_result.get('error')}")
                 consecutive_failures += 1
                 results.append({
@@ -3513,11 +3493,70 @@ def auto_loop(port: str, baud: int, project_dir: str, duration: float,
                     "error": flash_result.get("error"),
                     "consecutive_failures": consecutive_failures,
                 })
-
-                # 检查是否连续失败
                 if consecutive_failures >= max_consecutive_failures:
                     print(f"连续失败 {consecutive_failures} 次，停止调试")
                     break
+                continue
+
+            print("编译烧录成功，等待设备启动...")
+
+            # 步骤 4：验证修复 — 重新采集数据对比
+            print(f"\n[4/4] 验证修复...")
+            time.sleep(2.0)  # 等待设备启动
+            after_data = collect_data(port, baud, duration, send_cmds=send_cmds, send_hex=send_hex)
+            if not after_data.get("success"):
+                print(f"验证采集失败: {after_data.get('error')}")
+                results.append({
+                    "iteration": iteration,
+                    "success": False,
+                    "issues": analysis["issue_count"],
+                    "flash": True,
+                    "verified": False,
+                    "error": "验证采集失败",
+                })
+                continue
+
+            after_analysis = analyze_data(after_data, min_val, max_val, jump_threshold)
+            verify_result = verify_fix(data, after_data, analysis, after_analysis)
+            print_verification_result(verify_result)
+
+            # 写验证日志
+            write_debug_log(project_dir, iteration, after_analysis, verify_result)
+
+            if verify_result["status"] == "improved":
+                print(f"\n✅ 第 {iteration} 轮：修复成功！问题数 {analysis['issue_count']} → {after_analysis['issue_count']}")
+                results.append({
+                    "iteration": iteration,
+                    "success": True,
+                    "issues": after_analysis["issue_count"],
+                    "flash": True,
+                    "verified": True,
+                    "verify": verify_result,
+                    "fixes": fix_result.get("fixes", []),
+                    "inject": inject_result,
+                })
+                break
+            elif verify_result["status"] == "unchanged":
+                print(f"\n⚠️ 第 {iteration} 轮：问题未改善，继续下一轮")
+                results.append({
+                    "iteration": iteration,
+                    "success": False,
+                    "issues": after_analysis["issue_count"],
+                    "flash": True,
+                    "verified": False,
+                    "verify": verify_result,
+                })
+            else:
+                print(f"\n❌ 第 {iteration} 轮：问题恶化！停止调试")
+                results.append({
+                    "iteration": iteration,
+                    "success": False,
+                    "issues": after_analysis["issue_count"],
+                    "flash": True,
+                    "verified": False,
+                    "verify": verify_result,
+                })
+                break
 
         except Exception as e:
             print(f"第 {iteration} 轮发生异常: {e}")
@@ -3709,9 +3748,16 @@ def main() -> int:
     parser.add_argument("--input", help="输入数据文件")
     parser.add_argument("--output", help="输出文件路径")
     parser.add_argument("--list", action="store_true", help="列出可用串口")
-    parser.add_argument("--source-file", help="要注入代码的源文件路径（如 main.c）")
-    parser.add_argument("--auto-inject", action="store_true",
-                        help="自动注入修复代码到源文件（需配合 --source-file）")
+    parser.add_argument("--send-cmd", action="append", default=[],
+                        help="采集前发送的文本命令（可多次使用，如 --send-cmd HB --send-cmd REG）")
+    parser.add_argument("--send-hex", metavar="HEX",
+                        help="采集前发送的十六进制数据（如 --send-hex AA550100FF）")
+    parser.add_argument("--check-build", action="store_true",
+                        help="采集后检查 BUILD 时间戳确认是新固件")
+    parser.add_argument("--config", metavar="FILE",
+                        help="JSON 配置文件（自定义心跳前缀、寄存器位、问题规则等）")
+    parser.add_argument("--build-marker", help="编译时间戳前缀（默认 BUILD:）")
+    parser.add_argument("--heartbeat-prefix", help="心跳行前缀，逗号分隔（默认 HB,STATUS,DBG,DIAG）")
     parser.add_argument("--reset-method", choices=RESET_METHODS, default="dtr",
                         help="复位方法 (默认 dtr)")
     parser.add_argument("--verify-reset", action="store_true",
@@ -3744,6 +3790,15 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    # 加载配置
+    load_config(
+        config_path=args.config,
+        cli_overrides={
+            "build_marker": args.build_marker,
+            "heartbeat_prefix": args.heartbeat_prefix,
+        },
+    )
+
     if args.list:
         ports = serial.tools.list_ports.comports()
         if not ports:
@@ -3771,7 +3826,9 @@ def main() -> int:
     if args.mode == "collect":
         if not args.port:
             parser.error("collect 模式需要 --port")
-        result = collect_data(args.port, args.baud, args.duration, args.protocol)
+        result = collect_data(args.port, args.baud, args.duration, args.protocol,
+                              send_cmds=args.send_cmd or None,
+                              send_hex=args.send_hex)
         if args.output:
             Path(args.output).write_text(
                 json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -3781,7 +3838,9 @@ def main() -> int:
         if args.input:
             data = json.loads(Path(args.input).read_text(encoding="utf-8"))
         elif args.port:
-            data = collect_data(args.port, args.baud, args.duration, args.protocol)
+            data = collect_data(args.port, args.baud, args.duration, args.protocol,
+                                send_cmds=args.send_cmd or None,
+                                send_hex=args.send_hex)
         else:
             parser.error("analyze 模式需要 --input 或 --port")
 
@@ -3809,9 +3868,10 @@ def main() -> int:
                 jump_threshold=args.jump_threshold,
                 max_iterations=args.max_iterations,
                 reset_method=args.reset_method,
+                verify_reset=args.verify_reset,
                 timeout=args.timeout,
-                source_file=args.source_file,
-                auto_inject=args.auto_inject,
+                send_cmds=args.send_cmd or None,
+                send_hex=args.send_hex,
             )
 
             if args.output:
@@ -3828,7 +3888,8 @@ def main() -> int:
             print("=" * 60)
             print("步骤 1: 数据采集")
             print("=" * 60)
-            data = collect_data(args.port, args.baud, args.duration, args.protocol)
+            data = collect_data(args.port, args.baud, args.duration, args.protocol,
+                                send_cmds=args.send_cmd or None)
 
             if not data.get("success"):
                 print(f"数据采集失败: {data.get('error')}")

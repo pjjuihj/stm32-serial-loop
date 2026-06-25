@@ -1,0 +1,17 @@
+{
+    "build_marker": "BUILD:",
+    "heartbeat_prefixes": ["HB", "STATUS", "DBG", "DIAG"],
+    "register_bits": {
+        "en":    {"bit": 0,  "width": 1},
+        "circ":  {"bit": 8,  "width": 1},
+        "minc":  {"bit": 10, "width": 1},
+        "psize": {"bit": 11, "width": 2},
+        "msize": {"bit": 13, "width": 2}
+    },
+    "register_name_pattern": "(?:DMA_)?CR|SR|CSR|ISR",
+    "issue_rules": [
+        {"field": "h",      "op": "<=", "value": 1, "type": "counter_stopped"},
+        {"field": "c",      "op": "<=", "value": 1, "type": "counter_stopped"},
+        {"field": "*_circ", "op": "==",  "value": 0, "type": "no_circ"}
+    ]
+}
