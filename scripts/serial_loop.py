@@ -55,6 +55,204 @@ except ImportError:
     sys.exit(1)
 
 
+# === stm32-keil-workflow 集成 ===
+
+# 查找 stm32-keil-workflow 的 shared.py
+_SKILL_DIR = Path(__file__).parent.parent.parent
+_SHARED_PY = _SKILL_DIR / "stm32-keil-workflow" / "scripts" / "shared.py"
+_WORKFLOW_PY = _SKILL_DIR / "stm32-keil-workflow" / "scripts" / "workflow.py"
+_ERROR_TRACKER_PY = _SKILL_DIR / "stm32-keil-workflow" / "scripts" / "error_tracker.py"
+_ERROR_SUMMARY_PY = _SKILL_DIR / "stm32-keil-workflow" / "scripts" / "error_summary.py"
+_TECH_SPEC_PY = _SKILL_DIR / "stm32-keil-workflow" / "scripts" / "tech_spec.py"
+_HEALTH_CHECK_PY = _SKILL_DIR / "stm32-keil-workflow" / "scripts" / "health_check.py"
+_BRICK_PREVENTION_PY = _SKILL_DIR / "stm32-keil-workflow" / "scripts" / "brick_prevention.py"
+_DETECT_CONFIG_PY = _SKILL_DIR / "stm32-keil-workflow" / "scripts" / "detect_config.py"
+
+# 导入 shared.py（如果存在）
+_shared = None
+if _SHARED_PY.exists():
+    sys.path.insert(0, str(_SHARED_PY.parent))
+    try:
+        import shared as _shared
+    except ImportError:
+        pass
+
+
+def _find_script(name: str) -> Path | None:
+    """查找 stm32-keil-workflow 中的脚本。"""
+    path = _SKILL_DIR / "stm32-keil-workflow" / "scripts" / name
+    return path if path.exists() else None
+
+
+def _run_workflow_script(script_path: Path, args: list[str],
+                         timeout: int = 300) -> dict:
+    """运行 stm32-keil-workflow 脚本。
+
+    Args:
+        script_path: 脚本路径
+        args: 命令行参数
+        timeout: 超时时间（秒）
+
+    Returns:
+        执行结果
+    """
+    import subprocess
+
+    cmd = [sys.executable, str(script_path)] + args
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return {
+            "success": proc.returncode == 0,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "returncode": proc.returncode,
+        }
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": f"脚本超时 ({timeout}s)"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def detect_project(project_dir: str = ".") -> dict:
+    """自动检测项目配置。
+
+    Args:
+        project_dir: 项目目录
+
+    Returns:
+        项目配置
+    """
+    project_path = Path(project_dir).resolve()
+    result = {
+        "project_dir": str(project_path),
+        "uvprojx": None,
+        "ioc": None,
+        "axf": None,
+        "workflow_result": None,
+    }
+
+    # 查找 .uvprojx
+    uvprojx_files = list(project_path.glob("**/*.uvprojx"))
+    if uvprojx_files:
+        result["uvprojx"] = str(uvprojx_files[0])
+
+    # 查找 .ioc
+    ioc_files = list(project_path.glob("**/*.ioc"))
+    if ioc_files:
+        result["ioc"] = str(ioc_files[0])
+
+    # 查找 .axf
+    axf_files = list(project_path.glob("**/*.axf"))
+    if axf_files:
+        result["axf"] = str(axf_files[0])
+
+    # 查找 workflow_result.json
+    workflow_result = project_path / "workflow_result.json"
+    if workflow_result.exists():
+        try:
+            result["workflow_result"] = json.loads(
+                workflow_result.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    return result
+
+
+def run_health_check(project_dir: str = ".") -> dict:
+    """运行项目健康检查。
+
+    Args:
+        project_dir: 项目目录
+
+    Returns:
+        健康检查结果
+    """
+    if not _HEALTH_CHECK_PY.exists():
+        return {"success": False, "error": "health_check.py 未找到"}
+
+    return _run_workflow_script(
+        _HEALTH_CHECK_PY,
+        ["--project", project_dir],
+        timeout=60,
+    )
+
+
+def run_brick_check(project_dir: str = ".") -> dict:
+    """运行死机预防检查。
+
+    Args:
+        project_dir: 项目目录
+
+    Returns:
+        死机检查结果
+    """
+    if not _BRICK_PREVENTION_PY.exists():
+        return {"success": False, "error": "brick_prevention.py 未找到"}
+
+    return _run_workflow_script(
+        _BRICK_PREVENTION_PY,
+        ["--auto", project_dir],
+        timeout=60,
+    )
+
+
+def run_error_summary(project_dir: str = ".") -> dict:
+    """运行错误总结。
+
+    Args:
+        project_dir: 项目目录
+
+    Returns:
+        错误总结结果
+    """
+    if not _ERROR_SUMMARY_PY.exists():
+        return {"success": False, "error": "error_summary.py 未找到"}
+
+    return _run_workflow_script(
+        _ERROR_SUMMARY_PY,
+        ["--auto", project_dir, "--text"],
+        timeout=60,
+    )
+
+
+def run_tech_spec(project_dir: str = ".") -> dict:
+    """生成技术规范。
+
+    Args:
+        project_dir: 项目目录
+
+    Returns:
+        技术规范结果
+    """
+    if not _TECH_SPEC_PY.exists():
+        return {"success": False, "error": "tech_spec.py 未找到"}
+
+    return _run_workflow_script(
+        _TECH_SPEC_PY,
+        ["--auto", project_dir, "--text"],
+        timeout=60,
+    )
+
+
+def detect_config(project_dir: str = ".") -> dict:
+    """检测项目配置。
+
+    Args:
+        project_dir: 项目目录
+
+    Returns:
+        配置检测结果
+    """
+    if not _DETECT_CONFIG_PY.exists():
+        return {"success": False, "error": "detect_config.py 未找到"}
+
+    return _run_workflow_script(
+        _DETECT_CONFIG_PY,
+        ["--scan", project_dir],
+        timeout=30,
+    )
+
+
 # === 进度跟踪 ===
 
 class ProgressTracker:
@@ -109,6 +307,19 @@ MAX_ERRORS = 100  # 最大错误数
 PROGRESS_BAR_LENGTH = 40  # 进度条长度
 SERIAL_TIMEOUT = 0.1  # 串口超时（秒）
 RETRY_DELAY = 1  # 重试延迟（秒）
+SUBPROCESS_TIMEOUT_SHORT = 30  # subprocess 短超时（秒）
+SUBPROCESS_TIMEOUT_COMPILE = 300  # 编译烧录超时（秒）
+SUBPROCESS_TIMEOUT_WORKFLOW = 600  # 工作流超时（秒）
+RESET_TIMEOUT = 5.0  # 串口复位打开超时（秒）
+MAX_CONSECUTIVE_FAILURES = 3  # 最大连续失败次数
+RESET_SIGNAL_DELAY = 0.1  # 复位信号持续时间（秒）
+RESET_BOOT_DELAY = 0.5    # 复位后等待设备启动时间（秒）
+TREND_SLOPE_THRESHOLD = 0.1  # 趋势斜率阈值
+R_SQUARED_THRESHOLD = 0.7  # R² 阈值
+OUTLIER_Z_THRESHOLD = 2.0  # 异常值 Z-score 阈值
+STABILITY_THRESHOLD_LOW = 1.0  # 稳定性阈值（低）
+STABILITY_THRESHOLD_HIGH = 5.0  # 稳定性阈值（高）
+PERIODICITY_CONFIDENCE_THRESHOLD = 0.5  # 周期性置信度阈值
 
 
 # === 数据采集 ===
@@ -212,7 +423,8 @@ def collect_data(port: str, baud: int = 115200, duration: float = 10.0,
     except KeyboardInterrupt:
         pass
     finally:
-        ser.close()
+        if ser and ser.is_open:
+            ser.close()
 
     # 提取所有数值
     all_values = []
@@ -246,7 +458,20 @@ def parse_values(text: str) -> list[float]:
       "ADC:2048"
     """
     values = []
-    pattern = r'-?\d+\.?\d*'
+
+    # 优先匹配 "key:value" 或 "key=value" 格式中的数值
+    kv_pattern = r'[:=]\s*(-?\d+\.?\d*)'
+    kv_matches = re.findall(kv_pattern, text)
+    if kv_matches:
+        for match in kv_matches:
+            try:
+                values.append(float(match))
+            except ValueError:
+                continue
+        return values
+
+    # 回退到通用匹配（要求前后是逗号、空格、行首/行尾或括号）
+    pattern = r'(?:^|[,;\s\(])(-?\d+\.?\d*)(?:$|[,;\s\)])'
     matches = re.findall(pattern, text)
     for match in matches:
         try:
@@ -436,6 +661,9 @@ def analyze_data(data: dict, min_val: float = None, max_val: float = None,
 def analyze_range(values: list[float], min_val: float = None,
                   max_val: float = None) -> dict:
     """分析数据范围。"""
+    if not values:
+        return {"count": 0, "min": 0, "max": 0, "mean": 0, "range": 0, "out_of_range": []}
+
     result = {
         "count": len(values),
         "min": min(values),
@@ -487,9 +715,9 @@ def analyze_trend(values: list[float]) -> dict:
     r_squared = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
 
     # 判断趋势
-    if slope > 0.1:
+    if slope > TREND_SLOPE_THRESHOLD:
         trend = "上升"
-    elif slope < -0.1:
+    elif slope < -TREND_SLOPE_THRESHOLD:
         trend = "下降"
     else:
         trend = "平稳"
@@ -505,7 +733,7 @@ def analyze_trend(values: list[float]) -> dict:
     }
 
 
-def analyze_outliers(values: list[float], threshold: float = 2.0) -> dict:
+def analyze_outliers(values: list[float], threshold: float = OUTLIER_Z_THRESHOLD) -> dict:
     """检测异常值。
 
     Args:
@@ -587,7 +815,7 @@ def analyze_periodicity(values: list[float]) -> dict:
         "count": n,
         "period": period,
         "confidence": confidence,
-        "is_periodic": confidence > 0.5,
+        "is_periodic": confidence > PERIODICITY_CONFIDENCE_THRESHOLD,
         "peaks": peaks[:5],
     }
 
@@ -619,9 +847,9 @@ def analyze_stability(values: list[float], window_size: int = 10) -> dict:
     min_std = min(std_devs)
 
     # 判断稳定性
-    if mean_std < 1.0:
+    if mean_std < STABILITY_THRESHOLD_LOW:
         stability = "稳定"
-    elif mean_std < 5.0:
+    elif mean_std < STABILITY_THRESHOLD_HIGH:
         stability = "较稳定"
     else:
         stability = "不稳定"
@@ -731,7 +959,7 @@ def auto_detect_issues(values: list[float]) -> dict:
 
     # 检测趋势问题
     trend_result = analyze_trend(values)
-    if trend_result.get("trend") == "下降" and trend_result.get("r_squared", 0) > 0.7:
+    if trend_result.get("trend") == "下降" and trend_result.get("r_squared", 0) > R_SQUARED_THRESHOLD:
         issues.append({
             "type": "trend",
             "description": "数据持续下降",
@@ -964,9 +1192,11 @@ def generate_modification_guide(modifications: list[dict]) -> str:
 
     lines.append("## 注意事项")
     lines.append("")
-    lines.append("1. 在 CubeMX 重新生成代码后，需要重新添加这些函数")
+    lines.append("1. **CubeMX 兼容性**: 将函数添加到 `/* USER CODE BEGIN */` 和 `/* USER CODE END */` 之间，")
+    lines.append("   这样 CubeMX 重新生成代码时不会丢失你的修改。")
     lines.append("2. 滤波器参数需要根据实际情况调整")
     lines.append("3. 建议在调试阶段保留原始数据用于对比")
+    lines.append("4. **线程安全**: 使用结构体封装的滤波器可以在 ISR 和主循环中独立使用不同的实例")
     lines.append("")
 
     return "\n".join(lines)
@@ -997,8 +1227,8 @@ def verify_fix(before_data: dict, after_data: dict, before_analysis: dict,
     before_mean = sum(before_values) / len(before_values) if before_values else 0
     after_mean = sum(after_values) / len(after_values) if after_values else 0
 
-    before_std = (sum((x - before_mean) ** 2 for x in before_values) / len(before_values)) ** 0.5 if before_values else 0
-    after_std = (sum((x - after_mean) ** 2 for x in after_values) / len(after_values)) ** 0.5 if after_values else 0
+    before_std = (sum((x - before_mean) ** 2 for x in before_values) / len(before_values)) ** 0.5 if len(before_values) > 1 else 0
+    after_std = (sum((x - after_mean) ** 2 for x in after_values) / len(after_values)) ** 0.5 if len(after_values) > 1 else 0
 
     # 判断修复效果
     if after_issues < before_issues:
@@ -1059,36 +1289,21 @@ def search_error_history(keyword: str) -> list[dict]:
     Returns:
         搜索结果
     """
-    import subprocess
-
-    # 查找 error_tracker.py
-    error_tracker_script = Path(__file__).parent.parent.parent / "stm32-keil-workflow" / "scripts" / "error_tracker.py"
-    if not error_tracker_script.exists():
+    script = _find_script("error_tracker.py")
+    if not script:
         return []
 
-    # 构建命令
-    cmd = [sys.executable, str(error_tracker_script), "--search", keyword, "--text"]
+    result = _run_workflow_script(script, ["--search", keyword, "--text"])
+    if not result.get("success"):
+        return []
 
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if proc.returncode == 0:
-            # 解析输出
-            results = []
-            lines = proc.stdout.splitlines()
-            for line in lines:
-                if line.startswith("["):
-                    # 解析格式: [id] error -> fix
-                    parts = line.split("->")
-                    if len(parts) == 2:
-                        results.append({
-                            "error": parts[0].strip(),
-                            "fix": parts[1].strip(),
-                        })
-            return results
-    except Exception:
-        pass
-
-    return []
+    results = []
+    for line in result["stdout"].splitlines():
+        if line.startswith("["):
+            parts = line.split("->")
+            if len(parts) == 2:
+                results.append({"error": parts[0].strip(), "fix": parts[1].strip()})
+    return results
 
 
 def get_fix_suggestions_from_history(error_type: str) -> list[dict]:
@@ -1100,32 +1315,17 @@ def get_fix_suggestions_from_history(error_type: str) -> list[dict]:
     Returns:
         修复建议列表
     """
-    import subprocess
-
-    # 查找 error_tracker.py
-    error_tracker_script = Path(__file__).parent.parent.parent / "stm32-keil-workflow" / "scripts" / "error_tracker.py"
-    if not error_tracker_script.exists():
+    script = _find_script("error_tracker.py")
+    if not script:
         return []
 
-    # 构建命令
-    cmd = [sys.executable, str(error_tracker_script), "--suggest", error_type, "--text"]
+    result = _run_workflow_script(script, ["--suggest", error_type, "--text"])
+    if not result.get("success"):
+        return []
 
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if proc.returncode == 0:
-            # 解析输出
-            results = []
-            lines = proc.stdout.splitlines()
-            for line in lines:
-                if line.startswith("-"):
-                    results.append({
-                        "suggestion": line[1:].strip(),
-                    })
-            return results
-    except Exception:
-        pass
-
-    return []
+    return [{"suggestion": line[1:].strip()}
+            for line in result["stdout"].splitlines()
+            if line.startswith("-")]
 
 
 def record_error_fix(error: str, fix: str, file: str = None) -> bool:
@@ -1139,23 +1339,16 @@ def record_error_fix(error: str, fix: str, file: str = None) -> bool:
     Returns:
         是否成功
     """
-    import subprocess
-
-    # 查找 error_tracker.py
-    error_tracker_script = Path(__file__).parent.parent.parent / "stm32-keil-workflow" / "scripts" / "error_tracker.py"
-    if not error_tracker_script.exists():
+    script = _find_script("error_tracker.py")
+    if not script:
         return False
 
-    # 构建命令
-    cmd = [sys.executable, str(error_tracker_script), "--record", "--error", error, "--fix", fix]
+    args = ["--record", "--error", error, "--fix", fix]
     if file:
-        cmd.extend(["--file", file])
+        args.extend(["--file", file])
 
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        return proc.returncode == 0
-    except Exception:
-        return False
+    result = _run_workflow_script(script, args)
+    return result.get("success", False)
 
 
 # === 技术规范集成 ===
@@ -1169,31 +1362,20 @@ def get_project_config(project_dir: str) -> dict:
     Returns:
         项目配置
     """
-    import subprocess
-
-    # 查找 tech_spec.py
-    tech_spec_script = Path(__file__).parent.parent.parent / "stm32-keil-workflow" / "scripts" / "tech_spec.py"
-    if not tech_spec_script.exists():
+    script = _find_script("tech_spec.py")
+    if not script:
         return {}
 
-    # 构建命令
-    cmd = [sys.executable, str(tech_spec_script), "--auto", project_dir, "--text"]
+    result = _run_workflow_script(script, ["--auto", project_dir, "--text"])
+    if not result.get("success"):
+        return {}
 
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if proc.returncode == 0:
-            # 解析输出
-            config = {}
-            lines = proc.stdout.splitlines()
-            for line in lines:
-                if ":" in line:
-                    key, value = line.split(":", 1)
-                    config[key.strip()] = value.strip()
-            return config
-    except Exception:
-        pass
-
-    return {}
+    config = {}
+    for line in result["stdout"].splitlines():
+        if ":" in line:
+            key, value = line.split(":", 1)
+            config[key.strip()] = value.strip()
+    return config
 
 
 def get_peripheral_config(project_dir: str, peripheral: str) -> dict:
@@ -1206,29 +1388,15 @@ def get_peripheral_config(project_dir: str, peripheral: str) -> dict:
     Returns:
         外设配置
     """
-    import subprocess
-
-    # 查找 cubemx_guide.py
-    cubemx_guide_script = Path(__file__).parent.parent.parent / "stm32-keil-workflow" / "scripts" / "cubemx_guide.py"
-    if not cubemx_guide_script.exists():
+    script = _find_script("cubemx_guide.py")
+    if not script:
         return {}
 
-    # 构建命令
-    cmd = [sys.executable, str(cubemx_guide_script), "--peripheral", peripheral]
+    result = _run_workflow_script(script, ["--peripheral", peripheral])
+    if not result.get("success"):
+        return {}
 
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if proc.returncode == 0:
-            # 解析输出
-            config = {
-                "peripheral": peripheral,
-                "guide": proc.stdout,
-            }
-            return config
-    except Exception:
-        pass
-
-    return {}
+    return {"peripheral": peripheral, "guide": result["stdout"]}
 
 
 def check_pin_conflict(project_dir: str) -> list[dict]:
@@ -1240,37 +1408,21 @@ def check_pin_conflict(project_dir: str) -> list[dict]:
     Returns:
         冲突列表
     """
-    import subprocess
-
-    # 查找 pin_checker.py
-    pin_checker_script = Path(__file__).parent.parent.parent / "stm32-keil-workflow" / "scripts" / "pin_checker.py"
-    if not pin_checker_script.exists():
+    script = _find_script("pin_checker.py")
+    if not script:
         return []
 
-    # 查找 ioc 文件
     ioc_files = list(Path(project_dir).glob("*.ioc"))
     if not ioc_files:
         return []
 
-    # 构建命令
-    cmd = [sys.executable, str(pin_checker_script), "--ioc", str(ioc_files[0])]
+    result = _run_workflow_script(script, ["--ioc", str(ioc_files[0])])
+    if not result.get("success"):
+        return []
 
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if proc.returncode == 0:
-            # 解析输出
-            conflicts = []
-            lines = proc.stdout.splitlines()
-            for line in lines:
-                if "conflict" in line.lower():
-                    conflicts.append({
-                        "description": line.strip(),
-                    })
-            return conflicts
-    except Exception:
-        pass
-
-    return []
+    return [{"description": line.strip()}
+            for line in result["stdout"].splitlines()
+            if "conflict" in line.lower()]
 
 
 # === 数据可视化 ===
@@ -1440,7 +1592,12 @@ def save_data_log(data: dict, analysis: dict, output_dir: str = "logs") -> dict:
     import os
 
     # 创建输出目录
-    os.makedirs(output_dir, exist_ok=True)
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except PermissionError:
+        return {"success": False, "error": f"无权限创建目录: {output_dir}"}
+    except OSError as e:
+        return {"success": False, "error": f"创建目录失败: {e}"}
 
     # 生成文件名
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1470,9 +1627,12 @@ def save_data_log(data: dict, analysis: dict, output_dir: str = "logs") -> dict:
         print(f"数据日志已保存: {filepath}")
         return {"success": True, "filepath": filepath}
 
-    except Exception as e:
+    except PermissionError:
+        print(f"保存数据日志失败: 无权限写入 {filepath}")
+        return {"success": False, "error": f"无权限写入: {filepath}"}
+    except OSError as e:
         print(f"保存数据日志失败: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": f"文件系统错误: {e}"}
 
 
 def load_data_log(filepath: str) -> dict:
@@ -1662,11 +1822,16 @@ def send_notification(title: str, message: str, method: str = "print") -> dict:
             print(f"保存通知失败: {e}")
 
     elif method == "sound":
-        # 发送声音通知
+        # 发送声音通知（跨平台）
         try:
-            import winsound
-            winsound.Beep(1000, 500)  # 1000Hz, 500ms
+            if sys.platform == "win32":
+                import winsound
+                winsound.Beep(1000, 500)  # 1000Hz, 500ms
+            else:
+                print("\a", end="", flush=True)  # BEL 字符
             print("声音通知已发送")
+        except ImportError:
+            print("声音通知不可用 (winsound 模块缺失)")
         except Exception:
             print("声音通知不可用")
 
@@ -1972,8 +2137,10 @@ float savitzky_golay_5(float *buffer) {
 
 def analyze_jumps(values: list[float], threshold: float = None) -> dict:
     """分析数据跳变。"""
+    if not values:
+        return {"count": 0, "mean_diff": 0, "max_diff": 0, "threshold": 0, "jumps": [], "jump_count": 0}
     if len(values) < 2:
-        return {"error": "数据不足"}
+        return {"count": len(values), "mean_diff": 0, "max_diff": 0, "threshold": 0, "jumps": [], "jump_count": 0}
 
     diffs = [abs(values[i+1] - values[i]) for i in range(len(values)-1)]
     mean_diff = sum(diffs) / len(diffs)
@@ -2172,6 +2339,66 @@ def generate_fix_code(analysis: dict) -> dict:
     }
 
 
+def inject_code_to_source(source_file: str, code: str, marker: str = "USER CODE BEGIN 0") -> dict:
+    """将生成的代码注入到源文件中。
+
+    Args:
+        source_file: 源文件路径
+        code: 要注入的代码
+        marker: CubeMX USER CODE 标记
+
+    Returns:
+        注入结果
+    """
+    try:
+        source_path = Path(source_file)
+        if not source_path.exists():
+            return {"success": False, "error": f"源文件不存在: {source_file}"}
+
+        content = source_path.read_text(encoding="utf-8")
+
+        # 查找 USER CODE 标记
+        begin_marker = f"/* {marker} */"
+        end_marker = marker.replace("BEGIN", "END")
+        end_marker = f"/* {end_marker} */"
+
+        begin_idx = content.find(begin_marker)
+        end_idx = content.find(end_marker)
+
+        if begin_idx == -1 or end_idx == -1:
+            return {"success": False, "error": f"未找到 USER CODE 标记: {marker}"}
+
+        # 检查是否已有相同代码（避免重复注入）
+        insert_pos = begin_idx + len(begin_marker)
+        existing_code = content[insert_pos:end_idx].strip()
+        code_stripped = code.strip()
+
+        # 简单去重：检查函数名是否已存在
+        import re
+        func_names = re.findall(r'(?:void|float|int)\s+(\w+)\s*\(', code)
+        for func_name in func_names:
+            if func_name in existing_code:
+                return {"success": False, "error": f"函数 {func_name} 已存在，跳过注入"}
+
+        # 注入代码
+        new_content = content[:insert_pos] + "\n" + code_stripped + "\n" + content[end_idx:]
+
+        # 备份原文件
+        backup_file = source_path.with_suffix(source_path.suffix + ".bak")
+        source_path.rename(backup_file)
+
+        # 写入新内容
+        source_path.write_text(new_content, encoding="utf-8")
+
+        print(f"代码已注入到: {source_file}")
+        print(f"原文件已备份到: {backup_file}")
+
+        return {"success": True, "source_file": source_file, "backup_file": str(backup_file)}
+
+    except Exception as e:
+        return {"success": False, "error": f"注入失败: {e}"}
+
+
 def generate_range_check_code() -> str:
     """生成范围检查代码。"""
     return '''
@@ -2194,19 +2421,31 @@ def generate_median_filter_code() -> str:
     """生成中值滤波代码。"""
     return '''
 // 中值滤波（窗口大小 5）
-float median_filter(float new_value) {
-    static float buffer[5] = {0};
-    static int index = 0;
-    float sorted[5];
+#define MEDIAN_FILTER_SIZE 5
+
+typedef struct {
+    float buffer[MEDIAN_FILTER_SIZE];
+    int index;
+} MedianFilter;
+
+void median_filter_init(MedianFilter *mf) {
+    for (int i = 0; i < MEDIAN_FILTER_SIZE; i++) {
+        mf->buffer[i] = 0;
+    }
+    mf->index = 0;
+}
+
+float median_filter_update(MedianFilter *mf, float new_value) {
+    float sorted[MEDIAN_FILTER_SIZE];
 
     // 更新缓冲区
-    buffer[index] = new_value;
-    index = (index + 1) % 5;
+    mf->buffer[mf->index] = new_value;
+    mf->index = (mf->index + 1) % MEDIAN_FILTER_SIZE;
 
     // 排序
-    memcpy(sorted, buffer, sizeof(buffer));
-    for (int i = 0; i < 4; i++) {
-        for (int j = i + 1; j < 5; j++) {
+    memcpy(sorted, mf->buffer, sizeof(mf->buffer));
+    for (int i = 0; i < MEDIAN_FILTER_SIZE - 1; i++) {
+        for (int j = i + 1; j < MEDIAN_FILTER_SIZE; j++) {
             if (sorted[i] > sorted[j]) {
                 float temp = sorted[i];
                 sorted[i] = sorted[j];
@@ -2215,11 +2454,13 @@ float median_filter(float new_value) {
         }
     }
 
-    return sorted[2]; // 返回中值
+    return sorted[MEDIAN_FILTER_SIZE / 2]; // 返回中值
 }
 
 // 使用示例
-// float filtered = median_filter(raw_value);
+// MedianFilter mf;
+// median_filter_init(&mf);
+// float filtered = median_filter_update(&mf, raw_value);
 '''
 
 
@@ -2227,22 +2468,36 @@ def generate_moving_average_code() -> str:
     """生成滑动平均滤波代码。"""
     return '''
 // 滑动平均滤波（窗口大小 10）
-float moving_average(float new_value) {
-    static float buffer[10] = {0};
-    static int index = 0;
-    static float sum = 0;
+#define MOVING_AVERAGE_SIZE 10
 
+typedef struct {
+    float buffer[MOVING_AVERAGE_SIZE];
+    int index;
+    float sum;
+} MovingAverage;
+
+void moving_average_init(MovingAverage *ma) {
+    for (int i = 0; i < MOVING_AVERAGE_SIZE; i++) {
+        ma->buffer[i] = 0;
+    }
+    ma->index = 0;
+    ma->sum = 0;
+}
+
+float moving_average_update(MovingAverage *ma, float new_value) {
     // 更新缓冲区
-    sum -= buffer[index];
-    buffer[index] = new_value;
-    sum += new_value;
-    index = (index + 1) % 10;
+    ma->sum -= ma->buffer[ma->index];
+    ma->buffer[ma->index] = new_value;
+    ma->sum += new_value;
+    ma->index = (ma->index + 1) % MOVING_AVERAGE_SIZE;
 
-    return sum / 10;
+    return ma->sum / MOVING_AVERAGE_SIZE;
 }
 
 // 使用示例
-// float filtered = moving_average(raw_value);
+// MovingAverage ma;
+// moving_average_init(&ma);
+// float filtered = moving_average_update(&ma, raw_value);
 '''
 
 
@@ -2308,22 +2563,33 @@ def generate_ema_filter_code() -> str:
     """生成指数移动平均滤波代码。"""
     return '''
 // 指数移动平均滤波 (EMA)
-float ema_filter(float new_value, float alpha) {
-    static float last_value = 0;
-    static int initialized = 0;
+typedef struct {
+    float last_value;
+    float alpha;
+    int initialized;
+} EMAFilter;
 
-    if (!initialized) {
-        last_value = new_value;
-        initialized = 1;
+void ema_filter_init(EMAFilter *ef, float alpha) {
+    ef->last_value = 0;
+    ef->alpha = alpha;
+    ef->initialized = 0;
+}
+
+float ema_filter_update(EMAFilter *ef, float new_value) {
+    if (!ef->initialized) {
+        ef->last_value = new_value;
+        ef->initialized = 1;
         return new_value;
     }
 
-    last_value = alpha * new_value + (1 - alpha) * last_value;
-    return last_value;
+    ef->last_value = ef->alpha * new_value + (1 - ef->alpha) * ef->last_value;
+    return ef->last_value;
 }
 
 // 使用示例
-// float filtered = ema_filter(raw_value, 0.1); // alpha 越小，滤波越强
+// EMAFilter ef;
+// ema_filter_init(&ef, 0.1);  // alpha 越小，滤波越强
+// float filtered = ema_filter_update(&ef, raw_value);
 '''
 
 
@@ -2331,22 +2597,33 @@ def generate_weighted_average_code() -> str:
     """生成加权平均滤波代码。"""
     return '''
 // 加权平均滤波（窗口大小 5）
-float weighted_average(float new_value) {
-    static float buffer[5] = {0};
-    static int index = 0;
+#define WEIGHTED_AVERAGE_SIZE 5
 
+typedef struct {
+    float buffer[WEIGHTED_AVERAGE_SIZE];
+    int index;
+} WeightedAverage;
+
+void weighted_average_init(WeightedAverage *wa) {
+    for (int i = 0; i < WEIGHTED_AVERAGE_SIZE; i++) {
+        wa->buffer[i] = 0;
+    }
+    wa->index = 0;
+}
+
+float weighted_average_update(WeightedAverage *wa, float new_value) {
     // 更新缓冲区
-    buffer[index] = new_value;
-    index = (index + 1) % 5;
+    wa->buffer[wa->index] = new_value;
+    wa->index = (wa->index + 1) % WEIGHTED_AVERAGE_SIZE;
 
     // 加权平均（权重：1, 2, 3, 2, 1）
     float weights[] = {1, 2, 3, 2, 1};
     float sum = 0;
     float weight_sum = 0;
 
-    for (int i = 0; i < 5; i++) {
-        int idx = (index + i) % 5;
-        sum += buffer[idx] * weights[i];
+    for (int i = 0; i < WEIGHTED_AVERAGE_SIZE; i++) {
+        int idx = (wa->index + i) % WEIGHTED_AVERAGE_SIZE;
+        sum += wa->buffer[idx] * weights[i];
         weight_sum += weights[i];
     }
 
@@ -2354,7 +2631,9 @@ float weighted_average(float new_value) {
 }
 
 // 使用示例
-// float filtered = weighted_average(raw_value);
+// WeightedAverage wa;
+// weighted_average_init(&wa);
+// float filtered = weighted_average_update(&wa, raw_value);
 '''
 
 
@@ -2362,120 +2641,702 @@ def generate_combination_filter_code() -> str:
     """生成组合滤波代码。"""
     return '''
 // 组合滤波：中值滤波 + 滑动平均
-float combination_filter(float new_value) {
+typedef struct {
+    MedianFilter mf;
+    MovingAverage ma;
+} CombinationFilter;
+
+void combination_filter_init(CombinationFilter *cf) {
+    median_filter_init(&cf->mf);
+    moving_average_init(&cf->ma);
+}
+
+float combination_filter_update(CombinationFilter *cf, float new_value) {
     // 第一级：中值滤波去除脉冲噪声
-    float median_filtered = median_filter(new_value);
+    float median_filtered = median_filter_update(&cf->mf, new_value);
 
     // 第二级：滑动平均平滑数据
-    float final_filtered = moving_average(median_filtered);
+    float final_filtered = moving_average_update(&cf->ma, median_filtered);
 
     return final_filtered;
 }
 
 // 使用示例
-// float filtered = combination_filter(raw_value);
+// CombinationFilter cf;
+// combination_filter_init(&cf);
+// float filtered = combination_filter_update(&cf, raw_value);
 '''
 
 
 # === 工作流集成 ===
 
-def compile_and_flash(project_dir: str, port: str = None, reset: bool = True) -> dict:
+def compile_and_flash(project_dir: str, port: str = None, reset: bool = True,
+                      reset_method: str = "dtr", verify_reset: bool = False,
+                      verify_pattern: str = None,
+                      health_check: bool = False,
+                      brick_check: bool = False) -> dict:
     """编译并烧录固件。
 
     Args:
         project_dir: 项目目录
         port: 串口号（烧录用）
         reset: 烧录后是否复位
+        reset_method: 复位方法 (dtr/rts/dtr_rts/break/custom/bootloader)
+        verify_reset: 复位后是否验证设备响应
+        verify_pattern: 验证匹配的字符串模式
+        health_check: 编译前是否运行健康检查
+        brick_check: 烧录前是否运行死机预防检查
 
     Returns:
         编译烧录结果
     """
-    import subprocess
+    # 烧录前健康检查
+    if health_check:
+        print("运行项目健康检查...")
+        health_result = run_health_check(project_dir)
+        if not health_result.get("success"):
+            print(f"⚠️ 健康检查失败: {health_result.get('error', '未知')}")
+        else:
+            print("✅ 健康检查通过")
 
     # 查找 workflow.py
-    workflow_script = Path(__file__).parent.parent.parent / "stm32-keil-workflow" / "scripts" / "workflow.py"
-    if not workflow_script.exists():
-        return {"success": False, "error": "workflow.py 未找到"}
+    workflow_script = _find_script("workflow.py")
+    if not workflow_script:
+        return {"success": False, "error": "workflow.py 未找到，请检查 stm32-keil-workflow 安装"}
 
     # 构建命令
-    cmd = [sys.executable, str(workflow_script), "--auto", project_dir, "--steps", "compile,flash"]
+    args = ["--auto", project_dir, "--steps", "compile,flash"]
     if port:
-        cmd.extend(["--port", port])
+        args.extend(["--port", port])
 
-    print(f"编译烧录: {' '.join(cmd)}")
+    print(f"编译烧录: workflow.py {' '.join(args)}")
 
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        result = {
-            "success": proc.returncode == 0,
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
-            "returncode": proc.returncode,
-        }
+    result = _run_workflow_script(workflow_script, args, timeout=SUBPROCESS_TIMEOUT_COMPILE)
 
-        # 烧录后复位
-        if result["success"] and reset and port:
-            print("烧录成功，复位设备...")
-            reset_result = reset_device(port)
+    # 烧录前死机预防检查
+    if result["success"] and brick_check:
+        print("运行死机预防检查...")
+        brick_result = run_brick_check(project_dir)
+        if not brick_result.get("success"):
+            print(f"⚠️ 死机预防检查失败: {brick_result.get('error', '未知')}")
+            print("建议先检查配置再烧录")
+
+    # 烧录后复位
+    if result["success"] and reset and port:
+        print(f"烧录成功，复位设备 (方法: {reset_method})...")
+        reset_result = reset_device(
+            port=port,
+            method=reset_method,
+            verify=verify_reset,
+            verify_pattern=verify_pattern,
+        )
+        result["reset"] = reset_result
+
+        if not reset_result["success"]:
+            print(f"⚠️ 复位失败: {reset_result.get('error')}，尝试带重试复位...")
+            reset_result = reset_with_retry(
+                port=port,
+                method=reset_method,
+                max_retries=3,
+                verify=verify_reset,
+                verify_pattern=verify_pattern,
+            )
             result["reset"] = reset_result
 
-        return result
-    except subprocess.TimeoutExpired:
-        return {"success": False, "error": "编译烧录超时"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    # 编译失败时输出错误总结
+    if not result["success"]:
+        print("编译失败，获取错误总结...")
+        summary = run_error_summary(project_dir)
+        if summary.get("success") and summary.get("stdout"):
+            print(summary["stdout"][:500])
+
+    return result
 
 
-def reset_device(port: str, baud: int = 115200, method: str = "dtr") -> dict:
+RESET_METHODS = [
+    "dtr",           # DTR 信号复位（连接 NRST）
+    "rts",           # RTS 信号复位（连接 NRST）
+    "dtr_rts",       # DTR+RTS 组合复位（交叉连接 BOOT0/NRST）
+    "break",         # BREAK 信号复位
+    "break_dtr",     # BREAK + DTR 组合复位
+    "custom",        # 自定义复位序列（DTR+RTS 同时拉低再拉高）
+    "bootloader",    # 进入 bootloader 模式（BOOT0 拉高后复位）
+]
+
+# 复位日志
+_reset_log: list[dict] = []
+
+# STM32 bootloader 握手字节
+_BOOTLOADER_ACK = 0x79
+_BOOTLOADER_NACK = 0x1F
+_BOOTLOADER_INIT = 0x7F
+
+# 默认启动标志（高置信度）
+DEFAULT_BOOT_MARKERS = ["STM32", "Ready", "Boot_OK", "SystemInit", "running"]
+
+# 低置信度标志（需更多数据佐证）
+LOW_CONFIDENCE_MARKERS = ["OK", "Init", "start"]
+
+
+def _check_port_available(port: str) -> dict:
+    """检查串口是否可用。
+
+    Args:
+        port: 串口号
+
+    Returns:
+        检查结果
+    """
+    import serial.tools.list_ports
+
+    available_ports = [p.device for p in serial.tools.list_ports.comports()]
+
+    if port not in available_ports:
+        # 提供诊断信息
+        if not available_ports:
+            return {
+                "available": False,
+                "error": f"串口 {port} 不可用，系统无可用串口",
+                "hint": "请检查 USB 连接和驱动安装",
+            }
+        return {
+            "available": False,
+            "error": f"串口 {port} 不可用",
+            "available_ports": available_ports,
+            "hint": f"可用串口: {', '.join(available_ports)}",
+        }
+
+    return {"available": True}
+
+
+def _log_reset(port: str, method: str, success: bool, error: str = None,
+               duration: float = 0, details: dict = None):
+    """记录复位日志。
+
+    Args:
+        port: 串口号
+        method: 复位方法
+        success: 是否成功
+        error: 错误信息
+        duration: 耗时（秒）
+        details: 额外详情
+    """
+    entry = {
+        "timestamp": datetime.now().isoformat(),
+        "port": port,
+        "method": method,
+        "success": success,
+        "error": error,
+        "duration": round(duration, 3),
+        "details": details or {},
+    }
+    _reset_log.append(entry)
+
+    # 限制日志大小
+    if len(_reset_log) > 100:
+        _reset_log.pop(0)
+
+
+def get_reset_log(last_n: int = 10) -> list[dict]:
+    """获取复位日志。
+
+    Args:
+        last_n: 返回最近 N 条
+
+    Returns:
+        日志列表
+    """
+    return _reset_log[-last_n:]
+
+
+def reset_device(port: str, baud: int = 115200, method: str = "dtr",
+                  timeout: float = 5.0, verify: bool = False,
+                  verify_timeout: float = 3.0,
+                  verify_pattern: str = None,
+                  signal_delay: float = None,
+                  boot_delay: float = None,
+                  invert_dtr: bool = False,
+                  invert_rts: bool = False) -> dict:
     """复位设备。
 
     Args:
         port: 串口号
         baud: 波特率
-        method: 复位方法 (dtr/rts/break/custom)
+        method: 复位方法 (dtr/rts/dtr_rts/break/break_dtr/custom/bootloader)
+        timeout: 串口打开超时时间（秒）
+        verify: 复位后是否验证设备响应
+        verify_timeout: 验证超时时间（秒）
+        verify_pattern: 验证匹配的字符串模式（如 "STM32", "Ready"）
+        signal_delay: 信号持续时间（秒），None 使用默认值
+        boot_delay: 复位后等待启动时间（秒），None 使用默认值
+        invert_dtr: 反转 DTR 极性（适配某些转接板）
+        invert_rts: 反转 RTS 极性（适配某些转接板）
 
     Returns:
         复位结果
     """
-    try:
-        ser = serial.Serial(port=port, baudrate=baud, timeout=1)
+    import threading
 
+    start_time = time.time()
+
+    # 迭代3: 延迟可配置
+    sig_delay = signal_delay if signal_delay is not None else RESET_SIGNAL_DELAY
+    boot_wait = boot_delay if boot_delay is not None else RESET_BOOT_DELAY
+
+    # 迭代6: 复位前串口预检测
+    port_check = _check_port_available(port)
+    if not port_check["available"]:
+        _log_reset(port, method, False, error=port_check["error"])
+        return {"success": False, "error": port_check["error"], "hint": port_check.get("hint")}
+
+    ser = None
+    try:
+        # 使用线程实现打开超时（迭代1: 确保超时后资源清理）
+        ser_result = [None]
+        ser_error = [None]
+
+        def open_serial():
+            try:
+                ser_result[0] = serial.Serial(port=port, baudrate=baud, timeout=1)
+            except serial.SerialException as e:
+                ser_error[0] = str(e)
+
+        thread = threading.Thread(target=open_serial, daemon=True)
+        thread.start()
+        thread.join(timeout=timeout)
+
+        if thread.is_alive():
+            # 迭代1: 线程仍在运行，但串口可能已被打开
+            # 等待一小段时间让线程完成
+            thread.join(timeout=0.5)
+            if thread.is_alive():
+                _log_reset(port, method, False, error="串口打开超时")
+                return {"success": False, "error": f"串口打开超时 ({timeout}s)"}
+
+        ser = ser_result[0]
+        if ser is None:
+            # 迭代18: 提供诊断信息
+            error_msg = ser_error[0] or f"无法打开串口: {port}"
+            hint = ""
+            if "PermissionError" in str(type(ser_error[0])) or "Access" in str(ser_error[0]):
+                hint = "串口可能被其他程序占用，请关闭串口监视器后重试"
+            elif "FileNotFoundError" in str(type(ser_error[0])):
+                hint = "串口设备不存在，请检查 USB 连接"
+            _log_reset(port, method, False, error=error_msg)
+            return {"success": False, "error": error_msg, "hint": hint}
+
+        # 迭代7: 复位前清空接收缓冲区
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+
+        # 迭代11: 极性处理
+        dtr_low = not invert_dtr
+        dtr_high = invert_dtr
+        rts_low = not invert_rts
+        rts_high = invert_rts
+
+        # 执行复位序列
         if method == "dtr":
-            # DTR 信号复位
-            ser.dtr = False
-            time.sleep(0.1)
-            ser.dtr = True
-            time.sleep(0.1)
+            # DTR 信号复位（DTR 连接到 NRST）
+            ser.dtr = dtr_low   # NRST 拉低
+            time.sleep(sig_delay)
+            ser.dtr = dtr_high  # NRST 释放
+            time.sleep(boot_wait)
 
         elif method == "rts":
-            # RTS 信号复位
-            ser.rts = False
-            time.sleep(0.1)
-            ser.rts = True
-            time.sleep(0.1)
+            # RTS 信号复位（RTS 连接到 NRST）
+            ser.rts = rts_low   # NRST 拉低
+            time.sleep(sig_delay)
+            ser.rts = rts_high  # NRST 释放
+            time.sleep(boot_wait)
+
+        elif method == "dtr_rts":
+            # DTR+RTS 组合复位（常见于 USB 转串口模块）
+            # DTR 控制 NRST，RTS 控制 BOOT0
+            ser.dtr = dtr_low   # NRST 拉低
+            ser.rts = rts_high  # BOOT0 拉高（确保从 Flash 启动）
+            time.sleep(sig_delay)
+            ser.dtr = dtr_high  # NRST 释放
+            ser.rts = rts_low   # BOOT0 拉低
+            time.sleep(boot_wait)
 
         elif method == "break":
             # BREAK 信号复位
-            ser.send_break(duration=0.1)
-            time.sleep(0.1)
+            ser.send_break(duration=sig_delay)
+            time.sleep(boot_wait)
+
+        elif method == "break_dtr":
+            # 迭代14: BREAK + DTR 组合（某些板子需要）
+            ser.send_break(duration=sig_delay)
+            time.sleep(sig_delay)
+            ser.dtr = dtr_low
+            time.sleep(sig_delay)
+            ser.dtr = dtr_high
+            time.sleep(boot_wait)
 
         elif method == "custom":
-            # 自定义复位序列
-            ser.dtr = False
-            ser.rts = False
-            time.sleep(0.1)
-            ser.dtr = True
-            ser.rts = True
+            # 自定义复位序列（DTR+RTS 同时操作）
+            ser.dtr = dtr_low
+            ser.rts = rts_low
+            time.sleep(sig_delay)
+            ser.dtr = dtr_high
+            ser.rts = rts_high
+            time.sleep(boot_wait)
+
+        elif method == "bootloader":
+            # 进入 STM32 bootloader 模式
+            # 序列：BOOT0 拉高 → NRST 拉低 → NRST 释放 → 等待
+            ser.rts = rts_high   # BOOT0 拉高
+            time.sleep(sig_delay)
+            ser.dtr = dtr_low    # NRST 拉低
+            time.sleep(sig_delay)
+            ser.dtr = dtr_high   # NRST 释放
+            time.sleep(boot_wait * 2)  # bootloader 启动需要更长时间
+
+            # 迭代13: 发送 0x7F 握手字节
+            ser.write(bytes([_BOOTLOADER_INIT]))
             time.sleep(0.1)
 
-        ser.close()
+            # 读取握手响应
+            handshake_data = ser.read(2)
+            if handshake_data and _BOOTLOADER_ACK in handshake_data:
+                print("STM32 bootloader 握手成功 (收到 0x79)")
+            elif handshake_data:
+                print(f"bootloader 响应: {handshake_data.hex(' ')}")
+            else:
+                print("bootloader 未响应握手（可能已进入 bootloader，等待命令）")
 
-        print(f"设备已复位 (方法: {method})")
-        return {"success": True, "method": method}
+        else:
+            _log_reset(port, method, False, error=f"未知复位方法: {method}")
+            return {"success": False, "error": f"未知复位方法: {method}"}
+
+        duration = time.time() - start_time
+        print(f"设备已复位 (方法: {method}, 耗时: {duration:.2f}s)")
+
+        # 验证复位是否成功
+        if verify:
+            verify_result = _verify_reset(
+                ser, verify_timeout, verify_pattern,
+                is_bootloader=(method == "bootloader"),
+            )
+            _log_reset(port, method, verify_result["success"],
+                       error=verify_result.get("error"),
+                       duration=duration, details=verify_result)
+            if not verify_result["success"]:
+                return {
+                    "success": False,
+                    "method": method,
+                    "error": f"复位验证失败: {verify_result['error']}",
+                    "duration": duration,
+                }
+            return {
+                "success": True,
+                "method": method,
+                "verify": verify_result,
+                "duration": duration,
+            }
+
+        _log_reset(port, method, True, duration=duration)
+        return {"success": True, "method": method, "duration": duration}
+
+    except serial.SerialException as e:
+        duration = time.time() - start_time
+        _log_reset(port, method, False, error=str(e), duration=duration)
+        print(f"复位失败: {e}")
+        return {"success": False, "error": f"串口错误: {e}", "duration": duration}
+    except Exception as e:
+        duration = time.time() - start_time
+        _log_reset(port, method, False, error=str(e), duration=duration)
+        print(f"复位失败: {e}")
+        return {"success": False, "error": str(e), "duration": duration}
+    finally:
+        if ser and ser.is_open:
+            ser.close()
+
+
+def _verify_reset(ser: serial.Serial, timeout: float = 3.0,
+                  pattern: str = None, is_bootloader: bool = False) -> dict:
+    """验证复位是否成功。
+
+    Args:
+        ser: 已打开的串口对象
+        timeout: 验证超时时间（秒）
+        pattern: 匹配的字符串模式
+        is_bootloader: 是否为 bootloader 模式
+
+    Returns:
+        验证结果
+    """
+    start_time = time.time()
+    received_data = bytearray()
+    min_data_len = 2  # 迭代10: 最小数据长度，避免噪声误判
+
+    # 迭代8: 预编译匹配模式
+    pattern_compiled = None
+    if pattern:
+        try:
+            pattern_compiled = re.compile(re.escape(pattern), re.IGNORECASE)
+        except re.error:
+            pattern_compiled = None
+
+    # 读取启动信息
+    while time.time() - start_time < timeout:
+        data = ser.read(64)  # 迭代7: 使用较小的读取块，响应更快
+        if data:
+            received_data.extend(data)
+            text = bytes(received_data).decode("utf-8", errors="replace")
+
+            # 迭代10: 数据量不足时跳过匹配
+            if len(received_data) < min_data_len:
+                continue
+
+            # 迭代13: bootloader 模式检查 0x79 ACK
+            if is_bootloader:
+                if _BOOTLOADER_ACK in received_data:
+                    return {
+                        "success": True,
+                        "matched": "bootloader_ack_0x79",
+                        "data": received_data.hex(" "),
+                    }
+                if _BOOTLOADER_NACK in received_data:
+                    return {
+                        "success": False,
+                        "error": "bootloader 返回 NACK (0x1F)",
+                        "data": received_data.hex(" "),
+                    }
+
+            # 迭代8: 检查是否匹配指定模式（大小写不敏感）
+            if pattern_compiled and pattern_compiled.search(text):
+                return {
+                    "success": True,
+                    "matched": pattern,
+                    "data": text[:200],
+                }
+
+            # 迭代4: 高置信度启动标志
+            for marker in DEFAULT_BOOT_MARKERS:
+                if marker.lower() in text.lower():
+                    return {
+                        "success": True,
+                        "matched": marker,
+                        "confidence": "high",
+                        "data": text[:200],
+                    }
+
+            # 迭代4: 低置信度标志需要更多数据
+            if len(received_data) >= 10:
+                for marker in LOW_CONFIDENCE_MARKERS:
+                    if marker.lower() in text.lower():
+                        return {
+                            "success": True,
+                            "matched": marker,
+                            "confidence": "low",
+                            "data": text[:200],
+                        }
+
+    # 超时但可能已收到数据
+    # 迭代10: 收到足够数据才算成功
+    if received_data and len(received_data) >= min_data_len:
+        text = bytes(received_data).decode("utf-8", errors="replace")
+        return {
+            "success": True,
+            "matched": "data_received",
+            "confidence": "low",
+            "data": text[:200],
+            "bytes": len(received_data),
+        }
+
+    return {
+        "success": False,
+        "error": "未收到设备响应",
+        "bytes": len(received_data),
+    }
+
+
+def reset_with_retry(port: str, baud: int = 115200, method: str = "dtr",
+                      max_retries: int = 3, retry_delay: float = 1.0,
+                      verify: bool = True, verify_pattern: str = None) -> dict:
+    """带重试的设备复位。
+
+    Args:
+        port: 串口号
+        baud: 波特率
+        method: 复位方法
+        max_retries: 最大重试次数
+        retry_delay: 重试间隔（秒）
+        verify: 是否验证复位
+        verify_pattern: 验证匹配模式
+
+    Returns:
+        复位结果
+    """
+    current_method = method  # 迭代5: 使用独立变量跟踪当前方法
+
+    for attempt in range(1, max_retries + 1):
+        print(f"复位尝试 {attempt}/{max_retries} (方法: {current_method})...")
+
+        result = reset_device(
+            port=port,
+            baud=baud,
+            method=current_method,
+            verify=verify,
+            verify_pattern=verify_pattern,
+        )
+
+        if result["success"]:
+            if attempt > 1:
+                print(f"复位成功 (第 {attempt} 次尝试)")
+            return result
+
+        print(f"复位失败: {result.get('error')}")
+        if attempt < max_retries:
+            # 迭代5: 正确切换回退方法
+            fallback_methods = ["dtr", "rts", "dtr_rts", "break", "custom"]
+            if current_method in fallback_methods:
+                fallback_methods.remove(current_method)
+            if fallback_methods:
+                next_method = fallback_methods[0]
+                print(f"切换复位方法: {current_method} → {next_method}")
+                current_method = next_method
+
+            time.sleep(retry_delay)
+
+    return {"success": False, "error": f"复位失败 (已尝试 {max_retries} 次)"}
+
+
+def enter_bootloader(port: str, baud: int = 115200) -> dict:
+    """进入 STM32 bootloader 模式。
+
+    Args:
+        port: 串口号
+        baud: 波特率
+
+    Returns:
+        操作结果
+    """
+    print("进入 STM32 bootloader 模式...")
+    return reset_device(port, baud, method="bootloader", verify=True)
+
+
+def exit_bootloader(port: str, baud: int = 115200) -> dict:
+    """退出 STM32 bootloader 模式（正常复位）。
+
+    Args:
+        port: 串口号
+        baud: 波特率
+
+    Returns:
+        操作结果
+    """
+    print("退出 bootloader 模式（正常复位）...")
+    return reset_device(port, baud, method="dtr_rts", verify=True)
+
+
+def stm32_system_reset(port: str, baud: int = 115200) -> dict:
+    """通过 bootloader 协议发送系统复位命令 (0x07)。
+
+    Args:
+        port: 串口号
+        baud: 波特率
+
+    Returns:
+        操作结果
+    """
+    # 迭代19: 先进入 bootloader
+    result = enter_bootloader(port, baud)
+    if not result["success"]:
+        return result
+
+    # 发送 Get 命令 (0x00) 验证 bootloader
+    ser = None
+    try:
+        ser = serial.Serial(port=port, baudrate=baud, timeout=2)
+        ser.reset_input_buffer()
+
+        # 发送 Get 命令
+        ser.write(bytes([0x00, 0xFF]))
+        time.sleep(0.2)
+        resp = ser.read(10)
+
+        if resp and resp[0] == _BOOTLOADER_ACK:
+            print("bootloader 通信正常，发送系统复位...")
+            # 发送 Go 命令 (0x21) 跳转到 0x08000000（Flash 起始地址）
+            addr = bytes([0x08, 0x00, 0x00, 0x00])
+            addr_complement = bytes([0x07, 0xFF, 0xFF, 0xFF])
+            ser.write(bytes([0x21]) + addr + addr_complement)
+            time.sleep(0.2)
+            go_resp = ser.read(2)
+            if go_resp and _BOOTLOADER_ACK in go_resp:
+                print("系统复位成功")
+                return {"success": True, "method": "bootloader_go"}
+            else:
+                # 备选：直接拉低 NRST 复位
+                print("Go 命令未响应，使用 DTR 复位...")
+                ser.close()
+                return reset_device(port, baud, method="dtr", verify=True)
+        else:
+            print("bootloader 未响应，使用普通复位...")
+            ser.close()
+            return reset_device(port, baud, method="dtr", verify=True)
 
     except Exception as e:
-        print(f"复位失败: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": f"系统复位失败: {e}"}
+    finally:
+        if ser and ser.is_open:
+            ser.close()
+
+
+def auto_detect_reset_method(port: str, baud: int = 115200) -> dict:
+    """自动探测最佳复位方法。
+
+    Args:
+        port: 串口号
+        baud: 波特率
+
+    Returns:
+        探测结果
+    """
+    # 迭代17: 依次尝试各种方法，找到能成功的
+    methods_to_try = ["dtr", "rts", "dtr_rts", "break", "custom"]
+
+    print(f"自动探测复位方法: {port}")
+    print("=" * 40)
+
+    results = []
+    for method in methods_to_try:
+        print(f"\n尝试 {method}...")
+        result = reset_device(
+            port=port,
+            baud=baud,
+            method=method,
+            verify=True,
+            verify_timeout=2.0,
+        )
+        results.append({
+            "method": method,
+            "success": result["success"],
+            "duration": result.get("duration", 0),
+            "verify": result.get("verify", {}),
+        })
+
+        if result["success"]:
+            print(f"✅ {method} 成功!")
+            return {
+                "success": True,
+                "recommended_method": method,
+                "all_results": results,
+            }
+        else:
+            print(f"❌ {method} 失败: {result.get('error')}")
+
+    # 所有方法都失败
+    print("\n所有复位方法均失败")
+    return {
+        "success": False,
+        "recommended_method": None,
+        "all_results": results,
+        "hint": "请检查硬件连接：DTR/RTS 是否连接到 NRST/BOOT0",
+    }
 
 
 def run_workflow_step(project_dir: str, steps: list[str], port: str = None) -> dict:
@@ -2483,45 +3344,31 @@ def run_workflow_step(project_dir: str, steps: list[str], port: str = None) -> d
 
     Args:
         project_dir: 项目目录
-        steps: 步骤列表
+        steps: 步骤列表 (compile/analyze/optimize/flash/health/brick_check/report)
         port: 串口号
 
     Returns:
         工作流结果
     """
-    import subprocess
+    workflow_script = _find_script("workflow.py")
+    if not workflow_script:
+        return {"success": False, "error": "workflow.py 未找到，请检查 stm32-keil-workflow 安装"}
 
-    # 查找 workflow.py
-    workflow_script = Path(__file__).parent.parent.parent / "stm32-keil-workflow" / "scripts" / "workflow.py"
-    if not workflow_script.exists():
-        return {"success": False, "error": "workflow.py 未找到"}
-
-    # 构建命令
-    cmd = [sys.executable, str(workflow_script), "--auto", project_dir, "--steps", ",".join(steps)]
+    args = ["--auto", project_dir, "--steps", ",".join(steps)]
     if port:
-        cmd.extend(["--port", port])
+        args.extend(["--port", port])
 
-    print(f"运行工作流: {' '.join(cmd)}")
+    print(f"运行工作流: workflow.py {' '.join(args)}")
 
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        return {
-            "success": proc.returncode == 0,
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
-            "returncode": proc.returncode,
-        }
-    except subprocess.TimeoutExpired:
-        return {"success": False, "error": "工作流超时"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    return _run_workflow_script(workflow_script, args, timeout=SUBPROCESS_TIMEOUT_WORKFLOW)
 
 
 def auto_loop(port: str, baud: int, project_dir: str, duration: float,
               min_val: float = None, max_val: float = None,
               jump_threshold: float = None, max_iterations: int = 5,
               reset_method: str = "dtr", retry_on_failure: bool = True,
-              timeout: int = 300, retry_delay: float = 2.0) -> dict:
+              timeout: int = 300, retry_delay: float = 2.0,
+              source_file: str = None, auto_inject: bool = False) -> dict:
     """自动闭环调试。
 
     Args:
@@ -2537,11 +3384,17 @@ def auto_loop(port: str, baud: int, project_dir: str, duration: float,
         retry_on_failure: 失败时是否重试
         timeout: 超时时间（秒）
         retry_delay: 重试延迟（秒）
+        source_file: 要注入代码的源文件路径（如 main.c）
+        auto_inject: 是否自动注入修复代码到源文件
 
     Returns:
         闭环调试结果
     """
     print(f"自动闭环调试: 最多 {max_iterations} 轮, 超时 {timeout}s")
+    if auto_inject and source_file:
+        print(f"代码注入: {source_file}")
+    else:
+        print("代码注入: 关闭（仅生成修复代码，需手动添加）")
     print("=" * 60)
 
     # 创建进度跟踪器
@@ -2552,9 +3405,14 @@ def auto_loop(port: str, baud: int, project_dir: str, duration: float,
 
     results = []
     consecutive_failures = 0
-    max_consecutive_failures = 3
+    max_consecutive_failures = MAX_CONSECUTIVE_FAILURES
 
     for iteration in range(1, max_iterations + 1):
+        # 检查超时
+        if time.time() - start_time > timeout:
+            print(f"\n超时 ({timeout}s)，停止调试")
+            break
+
         print(f"\n{'='*60}")
         print(f"第 {iteration} 轮调试")
         print(f"{'='*60}")
@@ -2564,7 +3422,7 @@ def auto_loop(port: str, baud: int, project_dir: str, duration: float,
 
         try:
             # 步骤 1：数据采集
-            print(f"\n[1/4] 数据采集 ({duration}s)...")
+            print(f"\n[1/5] 数据采集 ({duration}s)...")
             data = collect_data(port, baud, duration)
             if not data.get("success"):
                 print(f"数据采集失败: {data.get('error')}")
@@ -2583,15 +3441,15 @@ def auto_loop(port: str, baud: int, project_dir: str, duration: float,
 
                 # 重试
                 if retry_on_failure:
-                    print("等待 2 秒后重试...")
-                    time.sleep(2)
+                    print(f"等待 {retry_delay} 秒后重试...")
+                    time.sleep(retry_delay)
                 continue
 
             # 重置连续失败计数
             consecutive_failures = 0
 
             # 步骤 2：数据分析
-            print(f"\n[2/4] 数据分析...")
+            print(f"\n[2/5] 数据分析...")
             analysis = analyze_data(data, min_val, max_val, jump_threshold)
 
             # 步骤 3：判断是否需要修复
@@ -2608,15 +3466,30 @@ def auto_loop(port: str, baud: int, project_dir: str, duration: float,
                 })
                 break
 
-            print(f"\n[3/4] 发现 {analysis['issue_count']} 个问题，生成修复代码...")
+            print(f"\n[3/5] 发现 {analysis['issue_count']} 个问题，生成修复代码...")
             fix_result = generate_fix_code(analysis)
             if fix_result.get("success"):
                 print(f"生成了 {fix_result['fix_count']} 个修复代码:")
                 for fix in fix_result["fixes"]:
                     print(f"  - {fix['description']}")
 
-            # 步骤 4：编译烧录
-            print(f"\n[4/4] 编译烧录...")
+            # 步骤 4：注入代码（如果启用）
+            inject_result = None
+            if auto_inject and source_file and fix_result.get("success"):
+                print(f"\n[4/5] 注入修复代码到 {source_file}...")
+                for fix in fix_result["fixes"]:
+                    inject_result = inject_code_to_source(source_file, fix["code"])
+                    if not inject_result.get("success"):
+                        print(f"  注入失败: {inject_result.get('error')}")
+                        # 注入失败不阻断流程，继续编译烧录
+                        break
+                    else:
+                        print(f"  注入成功: {fix['type']}")
+            else:
+                print(f"\n[4/5] 跳过代码注入（未启用或无源文件）")
+
+            # 步骤 5：编译烧录
+            print(f"\n[5/5] 编译烧录...")
             flash_result = compile_and_flash(project_dir, port, reset=True)
             if flash_result.get("success"):
                 print("编译烧录成功")
@@ -2627,6 +3500,7 @@ def auto_loop(port: str, baud: int, project_dir: str, duration: float,
                     "flash": True,
                     "reset": flash_result.get("reset", {}),
                     "fixes": fix_result.get("fixes", []),
+                    "inject": inject_result,
                 })
             else:
                 print(f"编译烧录失败: {flash_result.get('error')}")
@@ -2798,17 +3672,33 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
+  # 数据采集
   %(prog)s --port COM3 --mode collect --duration 10
+
+  # 数据分析
   %(prog)s --port COM3 --mode analyze --duration 10 --min-val 0 --max-val 100
-  %(prog)s --port COM3 --mode loop --duration 10 --max-val 100
   %(prog)s --mode analyze --input data.json --min-val 0 --max-val 100
+
+  # 闭环调试
+  %(prog)s --port COM3 --mode loop --duration 10 --max-val 100
+  %(prog)s --port COM3 --mode loop --duration 10 --max-iterations 20 --timeout 600
+
+  # 设备复位
+  %(prog)s --port COM3 --mode reset
+  %(prog)s --port COM3 --mode reset --reset-method dtr_rts --verify-reset
+  %(prog)s --port COM3 --mode reset --bootloader
+
+  # 烧录后自动复位（在 loop 模式中）
+  %(prog)s --port COM3 --mode loop --duration 10 --reset-method dtr_rts --verify-reset
         """,
     )
 
     parser.add_argument("--port", help="串口号 (如 COM3)")
     parser.add_argument("--baud", type=int, default=115200, help="波特率 (默认 115200)")
-    parser.add_argument("--mode", choices=["collect", "analyze", "loop", "report"],
+    parser.add_argument("--mode", choices=["collect", "analyze", "loop", "report", "reset"],
                         default="collect", help="工作模式")
+    parser.add_argument("--auto", metavar="DIR",
+                        help="自动检测项目配置 (如 --auto .)")
     parser.add_argument("--duration", type=float, default=10, help="采集时长 (秒)")
     parser.add_argument("--protocol", choices=["text", "hex", "vofa"], default="text",
                         help="协议类型")
@@ -2819,6 +3709,38 @@ def main() -> int:
     parser.add_argument("--input", help="输入数据文件")
     parser.add_argument("--output", help="输出文件路径")
     parser.add_argument("--list", action="store_true", help="列出可用串口")
+    parser.add_argument("--source-file", help="要注入代码的源文件路径（如 main.c）")
+    parser.add_argument("--auto-inject", action="store_true",
+                        help="自动注入修复代码到源文件（需配合 --source-file）")
+    parser.add_argument("--reset-method", choices=RESET_METHODS, default="dtr",
+                        help="复位方法 (默认 dtr)")
+    parser.add_argument("--verify-reset", action="store_true",
+                        help="复位后验证设备响应")
+    parser.add_argument("--verify-pattern", help="复位验证匹配的字符串 (如 'STM32')")
+    parser.add_argument("--max-retries", type=int, default=3,
+                        help="复位最大重试次数 (默认 3)")
+    parser.add_argument("--bootloader", action="store_true",
+                        help="进入 STM32 bootloader 模式")
+    parser.add_argument("--signal-delay", type=float, default=None,
+                        help="复位信号持续时间/秒 (默认 0.1)")
+    parser.add_argument("--boot-delay", type=float, default=None,
+                        help="复位后等待启动时间/秒 (默认 0.5)")
+    parser.add_argument("--invert-dtr", action="store_true",
+                        help="反转 DTR 极性 (适配某些转接板)")
+    parser.add_argument("--invert-rts", action="store_true",
+                        help="反转 RTS 极性 (适配某些转接板)")
+    parser.add_argument("--auto-detect", action="store_true",
+                        help="自动探测最佳复位方法")
+    parser.add_argument("--reset-log", action="store_true",
+                        help="显示复位日志")
+    parser.add_argument("--max-iterations", type=int, default=5,
+                        help="自动闭环最大迭代次数 (默认 5)")
+    parser.add_argument("--timeout", type=int, default=300,
+                        help="闭环调试总超时时间/秒 (默认 300)")
+    parser.add_argument("--health-check", action="store_true",
+                        help="编译前运行项目健康检查")
+    parser.add_argument("--brick-check", action="store_true",
+                        help="烧录前运行死机预防检查")
 
     args = parser.parse_args()
 
@@ -2831,6 +3753,20 @@ def main() -> int:
         for p in ports:
             print(f"  {p.device}: {p.description}")
         return 0
+
+    # --auto: 自动检测项目配置
+    project_info = None
+    if args.auto:
+        project_info = detect_project(args.auto)
+        print(f"项目检测: {project_info['project_dir']}")
+        if project_info["uvprojx"]:
+            print(f"  工程文件: {project_info['uvprojx']}")
+        if project_info["ioc"]:
+            print(f"  CubeMX: {project_info['ioc']}")
+        if project_info["axf"]:
+            print(f"  编译产物: {project_info['axf']}")
+        if project_info["workflow_result"]:
+            print(f"  工作流结果: workflow_result.json")
 
     if args.mode == "collect":
         if not args.port:
@@ -2860,45 +3796,96 @@ def main() -> int:
         if not args.port:
             parser.error("loop 模式需要 --port")
 
-        # 步骤 1：数据采集
-        print("=" * 60)
-        print("步骤 1: 数据采集")
-        print("=" * 60)
-        data = collect_data(args.port, args.baud, args.duration, args.protocol)
+        # 多轮迭代模式：调用 auto_loop()
+        if args.max_iterations > 1:
+            print(f"自动闭环调试: 最多 {args.max_iterations} 轮")
+            result = auto_loop(
+                port=args.port,
+                baud=args.baud,
+                project_dir=".",
+                duration=args.duration,
+                min_val=args.min_val,
+                max_val=args.max_val,
+                jump_threshold=args.jump_threshold,
+                max_iterations=args.max_iterations,
+                reset_method=args.reset_method,
+                timeout=args.timeout,
+                source_file=args.source_file,
+                auto_inject=args.auto_inject,
+            )
 
-        if not data.get("success"):
-            print(f"数据采集失败: {data.get('error')}")
-            return 1
+            if args.output:
+                Path(args.output).write_text(
+                    json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+                print(f"结果已保存: {args.output}")
 
-        # 步骤 2：数据分析
-        print("\n" + "=" * 60)
-        print("步骤 2: 数据分析")
-        print("=" * 60)
-        analysis = analyze_data(data, args.min_val, args.max_val,
-                               args.jump_threshold, args.expected_interval)
+            if not result.get("success"):
+                return 1
 
-        # 步骤 3：生成报告
-        print("\n" + "=" * 60)
-        print("步骤 3: 生成报告")
-        print("=" * 60)
-        output = args.output or "loop_report.md"
-        generate_report(data, analysis, output)
-
-        # 步骤 4：判断是否需要修复
-        if analysis.get("issues"):
-            print("\n" + "=" * 60)
-            print("⚠️ 发现问题，建议进行代码修复")
-            print("=" * 60)
-            print("\n修复建议:")
-            for issue in analysis["issues"][:5]:
-                if issue["type"] == "out_of_range":
-                    print(f"  - 范围异常: 添加范围检查和限幅处理")
-                elif issue["type"] == "jump":
-                    print(f"  - 数据跳变: 添加中值滤波或滑动平均滤波")
-                elif issue["type"] == "discontinuity":
-                    print(f"  - 数据不连续: 增加缓冲区或优化中断处理")
+        # 单轮模式：原有流程
         else:
-            print("\n✅ 未发现明显问题，调试完成")
+            # 步骤 1：数据采集
+            print("=" * 60)
+            print("步骤 1: 数据采集")
+            print("=" * 60)
+            data = collect_data(args.port, args.baud, args.duration, args.protocol)
+
+            if not data.get("success"):
+                print(f"数据采集失败: {data.get('error')}")
+                return 1
+
+            # 步骤 2：数据分析
+            print("\n" + "=" * 60)
+            print("步骤 2: 数据分析")
+            print("=" * 60)
+            analysis = analyze_data(data, args.min_val, args.max_val,
+                                   args.jump_threshold, args.expected_interval)
+
+            # 步骤 3：生成报告
+            print("\n" + "=" * 60)
+            print("步骤 3: 生成报告")
+            print("=" * 60)
+            output = args.output or "loop_report.md"
+            generate_report(data, analysis, output)
+
+            # 步骤 4：判断是否需要修复
+            if analysis.get("issues"):
+                print("\n" + "=" * 60)
+                print("⚠️ 发现问题，建议进行代码修复")
+                print("=" * 60)
+
+                # 生成修复代码
+                fix_result = generate_fix_code(analysis)
+                if fix_result.get("success"):
+                    print(f"\n生成了 {fix_result['fix_count']} 个修复代码:")
+                    for fix in fix_result["fixes"]:
+                        print(f"  - {fix['description']}")
+
+                    # 代码注入（如果启用）
+                    if args.auto_inject and args.source_file:
+                        print(f"\n注入修复代码到 {args.source_file}...")
+                        for fix in fix_result["fixes"]:
+                            inject_result = inject_code_to_source(args.source_file, fix["code"])
+                            if inject_result.get("success"):
+                                print(f"  ✅ 注入成功: {fix['type']}")
+                            else:
+                                print(f"  ❌ 注入失败: {inject_result.get('error')}")
+                    elif args.auto_inject and not args.source_file:
+                        print("\n⚠️ --auto-inject 需要配合 --source-file 使用")
+                    else:
+                        print("\n提示: 使用 --auto-inject --source-file main.c 可自动注入代码")
+
+                # 打印修复建议
+                print("\n修复建议:")
+                for issue in analysis["issues"][:5]:
+                    if issue["type"] == "out_of_range":
+                        print(f"  - 范围异常: 添加范围检查和限幅处理")
+                    elif issue["type"] == "jump":
+                        print(f"  - 数据跳变: 添加中值滤波或滑动平均滤波")
+                    elif issue["type"] == "discontinuity":
+                        print(f"  - 数据不连续: 增加缓冲区或优化中断处理")
+            else:
+                print("\n✅ 未发现明显问题，调试完成")
 
     elif args.mode == "report":
         if not args.input:
@@ -2907,6 +3894,99 @@ def main() -> int:
         analysis = analyze_data(data, args.min_val, args.max_val,
                                args.jump_threshold, args.expected_interval)
         generate_report(data, analysis, args.output)
+
+    elif args.mode == "reset":
+        if not args.port:
+            parser.error("reset 模式需要 --port")
+
+        # 显示复位日志
+        if args.reset_log:
+            logs = get_reset_log(20)
+            if not logs:
+                print("无复位日志")
+            else:
+                print("复位日志 (最近 20 条):")
+                print("-" * 70)
+                for entry in logs:
+                    status = "✅" if entry["success"] else "❌"
+                    err = f" ({entry['error']})" if entry.get("error") else ""
+                    print(f"  {status} [{entry['timestamp'][:19]}] {entry['port']} "
+                          f"method={entry['method']} duration={entry['duration']:.3f}s{err}")
+            return 0
+
+        # 自动探测复位方法
+        if args.auto_detect:
+            print("=" * 60)
+            print("自动探测复位方法")
+            print("=" * 60)
+            result = auto_detect_reset_method(args.port, args.baud)
+            if result["success"]:
+                print(f"\n✅ 推荐方法: {result['recommended_method']}")
+            else:
+                print(f"\n❌ 所有方法均失败")
+                if result.get("hint"):
+                    print(f"   提示: {result['hint']}")
+                return 1
+            return 0
+
+        # bootloader 模式
+        if args.bootloader:
+            print("=" * 60)
+            print("进入 STM32 bootloader 模式")
+            print("=" * 60)
+            result = enter_bootloader(args.port, args.baud)
+            if result["success"]:
+                print("✅ 已进入 bootloader 模式")
+                if result.get("verify"):
+                    print(f"   验证: {result['verify'].get('matched', 'N/A')}")
+            else:
+                print(f"❌ 进入 bootloader 失败: {result.get('error')}")
+                return 1
+        else:
+            # 普通复位
+            print("=" * 60)
+            print(f"设备复位 (方法: {args.reset_method})")
+            print("=" * 60)
+
+            reset_kwargs = {
+                "port": args.port,
+                "baud": args.baud,
+                "method": args.reset_method,
+                "verify": args.verify_reset,
+                "verify_pattern": args.verify_pattern,
+                "signal_delay": args.signal_delay,
+                "boot_delay": args.boot_delay,
+                "invert_dtr": args.invert_dtr,
+                "invert_rts": args.invert_rts,
+            }
+
+            if args.max_retries > 1:
+                result = reset_with_retry(
+                    port=args.port,
+                    baud=args.baud,
+                    method=args.reset_method,
+                    max_retries=args.max_retries,
+                    verify=args.verify_reset,
+                    verify_pattern=args.verify_pattern,
+                )
+            else:
+                result = reset_device(**reset_kwargs)
+
+            if result["success"]:
+                print(f"✅ 设备复位成功 (方法: {result.get('method', 'N/A')})")
+                if result.get("duration"):
+                    print(f"   耗时: {result['duration']:.2f}s")
+                if result.get("verify"):
+                    v = result["verify"]
+                    conf = f" (置信度: {v.get('confidence', 'N/A')})" if v.get("confidence") else ""
+                    print(f"   验证: 匹配 '{v.get('matched', 'N/A')}'{conf}")
+                    if v.get("data"):
+                        print(f"   响应: {v['data'][:100]}")
+            else:
+                print(f"❌ 复位失败: {result.get('error')}")
+                if result.get("hint"):
+                    print(f"   提示: {result['hint']}")
+                return 1
 
     return 0
 
