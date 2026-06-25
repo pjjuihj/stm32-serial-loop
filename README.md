@@ -1,22 +1,62 @@
-# STM32 串口闭环调试
+# 串口闭环调试
 
-STM32 串口闭环调试自动化工具：数据采集 → 数据分析 → 代码生成 → 代码注入 → 编译烧录 → 设备复位 → 验证修复 → 闭环。
+通用嵌入式串口闭环调试工具：数据采集 → 数据分析 → 报告 → 对比历史 → 闭环验证。
+
+适用于任何嵌入式项目的传感器数据调试、执行器控制调试、协议通信调试。
+
+## 职责
+
+本工具是**测量工具**，不是维修工具：
+
+| 做 | 不做 |
+|----|------|
+| 采集串口数据 | 生成 C 代码 |
+| 分析数据（14 种分析） | 注入代码到源文件 |
+| 解析心跳/寄存器值 | 搜索社区 |
+| 对比历史数据 | 读 HAL 源码 |
+| 读项目文档匹配已知问题 | 生成诊断步骤 |
+| 写调试日志 | |
+| 复位设备 | |
 
 ## 功能特性
 
 | 功能 | 说明 |
 |------|------|
 | 📊 数据采集 | 文本、HEX、VOFA+、Modbus 协议 |
-| 🔍 数据分析 | 11 种分析：范围、跳变、连续性、趋势、异常值、周期性、稳定性、分布、统计、自动检测 |
+| 🔍 数据分析 | 14 种分析（见下方） |
+| 💓 心跳解析 | 通用 key:value 解析，自动识别寄存器位域 |
+| 📋 文档集成 | 自动搜索 docs/ 下的问题文档，匹配已知问题 |
+| 📝 调试日志 | 自动写入 docs/debug_logs/ |
 | 📈 数据可视化 | ASCII 图表、直方图、散点图 |
-| 🔧 代码生成 | 结构体封装滤波器（线程安全）：中值、滑动平均、EMA、卡尔曼、组合、巴特沃斯、自适应 |
-| 💉 代码注入 | 自动注入到 CubeMX USER CODE 标记之间，防重复，自动备份 |
-| 🔄 闭环调试 | 单轮或多轮自动迭代（`--max-iterations 20`） |
-| 🔌 设备复位 | 7 种方法、bootloader 握手、自动探测、极性配置、复位日志 |
-| 🏥 健康检查 | 编译前检查项目健康状态 |
-| 🛡️ 死机预防 | 烧录前检查固件/配置安全性 |
-| 📋 错误追踪 | 搜索历史、获取建议、记录修复 |
-| 🔗 工作流集成 | 自动调用 stm32-keil-workflow 的编译、烧录、分析工具 |
+| 🔄 闭环调试 | 单轮或多轮自动迭代，烧录后验证 |
+| 🔌 设备复位 | 7 种方法、bootloader 握手、自动探测 |
+| ⚙️ 配置系统 | JSON 配置文件，自定义心跳前缀/寄存器位/规则 |
+
+## 数据分析（14 种）
+
+### 基础分析
+
+| 分析 | 说明 |
+|------|------|
+| 范围检查 | 数据是否在有效范围内 |
+| 跳变检测 | 数据异常跳变 |
+| 连续性检查 | 采样间隔是否均匀 |
+| 统计分析 | 均值/中位数/标准差/方差 |
+| 趋势分析 | 上升/下降/平稳（线性回归） |
+| 异常值检测 | Z-score 方法 |
+| 周期性检测 | 自相关方法 |
+| 稳定性分析 | 滑动标准差 |
+| 分布分析 | 直方图/偏度/峰度 |
+
+### 嵌入式专用分析
+
+| 分析 | 说明 |
+|------|------|
+| 频率检测 | 零交越法估算信号频率 |
+| 卡值检测 | ADC/传感器值长时间不变 |
+| 时序间隙 | 采样间隔不均匀 |
+| 心跳解析 | key:value + 寄存器位域自动展开 |
+| DMA 状态 | 计数器递减检测、CIRC 位检测 |
 
 ## 快速开始
 
@@ -31,207 +71,136 @@ python serial_loop.py --port COM3 --mode collect --duration 10
 # 数据分析
 python serial_loop.py --port COM3 --mode analyze --duration 10 --min-val 0 --max-val 100
 
-# 单轮闭环
-python serial_loop.py --port COM3 --mode loop --duration 10 --max-val 100
+# 采集前发送诊断命令
+python serial_loop.py --port COM3 --mode collect --duration 10 --send-cmd "HB"
 
-# 多轮自动闭环（20轮 + 健康检查 + 死机预防）
-python serial_loop.py --auto . --port COM3 --mode loop --duration 10 \
-    --max-iterations 20 --health-check --brick-check \
-    --reset-method dtr_rts --verify-reset
+# 发送十六进制命令
+python serial_loop.py --port COM3 --mode collect --duration 10 --send-hex AA550100FF
+
+# 使用自定义配置
+python serial_loop.py --port COM3 --mode collect --config my_config.json
+
+# 闭环调试（采集 → 分析 → 报告 → 编译烧录 → 验证）
+python serial_loop.py --port COM3 --mode loop --duration 10 --max-iterations 5
+
+# 闭环 + 复位验证
+python serial_loop.py --port COM3 --mode loop --duration 10 \
+    --max-iterations 5 --reset-method dtr_rts --verify-reset
 
 # 自动探测最佳复位方法
 python serial_loop.py --port COM3 --mode reset --auto-detect
 ```
 
-## 工作模式
+## 配置系统
 
-| 模式 | 说明 | 命令 |
-|------|------|------|
-| `collect` | 数据采集 | `--mode collect --duration 10` |
-| `analyze` | 数据分析 | `--mode analyze --duration 10 --min-val 0 --max-val 100` |
-| `loop` | 闭环调试（单轮/多轮） | `--mode loop --max-iterations 20` |
-| `report` | 生成 Markdown 报告 | `--mode report --input data.json` |
-| `reset` | 设备复位 | `--mode reset --reset-method dtr_rts` |
+通过 `--config` JSON 文件自定义行为：
+
+```json
+{
+    "build_marker": "BUILD:",
+    "heartbeat_prefixes": ["HB", "STATUS", "DBG"],
+    "register_bits": {
+        "en":    {"bit": 0,  "width": 1},
+        "circ":  {"bit": 8,  "width": 1},
+        "psize": {"bit": 11, "width": 2},
+        "msize": {"bit": 13, "width": 2}
+    },
+    "register_name_pattern": "(?:DMA_)?CR|SR|CSR|ISR",
+    "issue_rules": [
+        {"field": "h",      "op": "<=", "value": 1, "type": "counter_stopped"},
+        {"field": "*_circ", "op": "==",  "value": 0, "type": "no_circ"}
+    ]
+}
+```
+
+配置优先级：默认值 → JSON 文件 → CLI 参数
+
+## 心跳解析
+
+自动识别固件输出的诊断信息，解析 key:value 对和寄存器值：
+
+```
+固件输出: "HB H:1 C:1 | DAC CR:0x000034B1 NDTR:128"
+自动解析: h=1, c=1, dac_cr=0x000034B1, ndtr=128
+寄存器位: dac_cr_en=1, dac_cr_circ=1, dac_cr_psize=1, dac_cr_msize=1
+```
+
+支持任意前缀（通过配置或 `--heartbeat-prefix` 自定义）。
+
+## 文档集成
+
+- 自动搜索 `docs/` 目录下的问题文档（solutions-log.md、issues.md、problems.md 等）
+- 将当前分析结果与已知问题对比
+- 每轮分析后自动写入 `docs/debug_logs/`
+
+## 闭环调试流程
+
+```
+1. 采集数据
+2. 分析 + 报告 + 对比文档 + 写日志
+3. 编译烧录 + 复位
+4. 重新采集验证（对比前后数据）
+   → 改善 → ✅ 修复成功
+   → 不变 → ⚠️ 继续下一轮
+   → 恶化 → ❌ 停止调试
+```
 
 ## CLI 参数
 
 ```
---port PORT             串口号 (如 COM3)
---baud BAUD             波特率 (默认 115200)
---mode MODE             collect/analyze/loop/report/reset
---auto DIR              自动检测项目 (如 --auto .)
---duration SECS         采集时长 (秒)
---protocol TYPE         text/hex/vofa
---min-val / --max-val   范围阈值
---jump-threshold        跳变阈值
---expected-interval     预期间隔
---input / --output      文件输入输出
---list                  列出可用串口
---source-file FILE      注入目标源文件
---auto-inject           自动注入修复代码
---max-iterations N      闭环迭代次数 (默认 5)
---timeout SECS          闭环总超时 (默认 300)
---health-check          编译前运行健康检查
---brick-check           烧录前运行死机预防
---reset-method METHOD   复位方法 (dtr/rts/dtr_rts/break/break_dtr/custom/bootloader)
---verify-reset          复位后验证设备响应
---verify-pattern STR    验证匹配的字符串
---max-retries N         复位重试次数 (默认 3)
---signal-delay SECS     复位信号持续时间
---boot-delay SECS       复位后等待启动时间
---invert-dtr            反转 DTR 极性
---invert-rts            反转 RTS 极性
---auto-detect           自动探测最佳复位方法
---reset-log             查看复位日志
---bootloader            进入 STM32 bootloader 模式
-```
+--port PORT           串口号 (如 COM3)
+--baud BAUD           波特率 (默认 115200)
+--mode MODE           collect/analyze/loop/report/reset
+--duration SECS       采集时长 (秒)
+--protocol TYPE       text/hex/vofa
+--min-val / --max-val 范围阈值
+--jump-threshold      跳变阈值
+--expected-interval   预期间隔
+--input / --output    文件输入输出
+--list                列出可用串口
+--send-cmd STR        采集前发送文本命令（可多次使用）
+--send-hex HEX        采集前发送十六进制数据
+--check-build         检查 BUILD 时间戳
+--config FILE         JSON 配置文件
+--build-marker STR    编译时间戳前缀
+--heartbeat-prefix STR 心跳行前缀（逗号分隔）
 
-## 核心流程
+闭环:
+--max-iterations N    迭代次数 (默认 5)
+--timeout SECS        总超时 (默认 300)
+--health-check        编译前健康检查
+--brick-check         烧录前死机预防
 
-```
-┌───────────────────────────────────────────────────────────────┐
-│                      串口闭环调试流程                          │
-└───────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-                      ┌──────────────────┐
-                      │ 1. 串口数据采集   │
-                      │    collect_data() │
-                      └────────┬─────────┘
-                               │
-                               ▼
-                      ┌──────────────────┐
-                      │ 2. 数据分析       │
-                      │    11 种分析算法  │
-                      └────────┬─────────┘
-                               │
-                               ▼
-                      ┌──────────────────┐
-                      │ 3. 代码生成       │
-                      │    结构体滤波器   │
-                      └────────┬─────────┘
-                               │
-                               ▼
-                      ┌──────────────────┐
-                      │ 4. 代码注入       │
-                      │    USER CODE 标记 │
-                      └────────┬─────────┘
-                               │
-                               ▼
-                      ┌──────────────────┐
-                      │ 5. 编译烧录       │
-                      │    workflow.py    │
-                      └────────┬─────────┘
-                               │
-                               ▼
-                      ┌──────────────────┐
-                      │ 6. 设备复位       │
-                      │    7 种方法       │
-                      └────────┬─────────┘
-                               │
-                               ▼
-                      ┌──────────────────┐
-                      │ 7. 验证修复       │
-                      │    串口数据采集   │
-                      └────────┬─────────┘
-                               │
-                  ┌────────────┴────────────┐
-                  │                         │
-                  ▼                         ▼
-           问题未解决                   问题解决
-           回到步骤 2                   闭环完成
-```
-
-## 使用场景
-
-### 传感器数据调试
-
-```bash
-# 温度传感器读数偶尔跳变为 0
-python serial_loop.py --port COM3 --mode collect --duration 30 --filter "temp"
-python serial_loop.py --port COM3 --mode analyze --duration 30 --min-val 0 --max-val 50
-python serial_loop.py --port COM3 --mode loop --duration 30 --min-val 0 --max-val 50 \
-    --max-iterations 5 --auto-inject --source-file main.c
-```
-
-### 电机转速调试
-
-```bash
-# 电机转速数据不稳定
-python serial_loop.py --port COM3 --mode collect --duration 10 --filter "rpm"
-python serial_loop.py --port COM3 --mode analyze --duration 10 --jump-threshold 100
-python serial_loop.py --port COM3 --mode loop --duration 10 --max-iterations 5
-```
-
-### 协议通信调试
-
-```bash
-# 串口数据包丢失
-python serial_loop.py --port COM3 --mode collect --duration 10 --protocol hex
-python serial_loop.py --port COM3 --mode analyze --duration 10 --expected-interval 0.1
-```
-
-### 设备复位调试
-
-```bash
-# 自动探测最佳复位方法
-python serial_loop.py --port COM3 --mode reset --auto-detect
-
-# 某些 CH340 转接板需要反转极性
-python serial_loop.py --port COM3 --mode reset --invert-dtr --verify-reset
-
-# 进入 STM32 bootloader
-python serial_loop.py --port COM3 --mode reset --bootloader
-
-# 查看复位历史
-python serial_loop.py --port COM3 --mode reset --reset-log
-```
-
-## 滤波算法（结构体封装，线程安全）
-
-| 算法 | 结构体 | 适用场景 |
-|------|--------|---------|
-| 中值滤波 | `MedianFilter` | 去除脉冲噪声 |
-| 滑动平均 | `MovingAverage` | 平滑数据 |
-| 指数移动平均 | `EMAFilter` | 实时平滑 |
-| 卡尔曼滤波 | `KalmanFilter` | 高精度滤波 |
-| 加权平均 | `WeightedAverage` | 加权平滑 |
-| 组合滤波 | `CombinationFilter` | 中值 + 滑动平均 |
-| 巴特沃斯 | `ButterworthFilter` | 低通滤波 |
-| 自适应(LMS) | `AdaptiveFilter` | 复杂环境 |
-
-```c
-// 示例：中值滤波（线程安全，每个传感器独立实例）
-MedianFilter mf;
-median_filter_init(&mf);
-float filtered = median_filter_update(&mf, raw_value);
+复位:
+--reset-method METHOD dtr/rts/dtr_rts/break/break_dtr/custom/bootloader
+--verify-reset        复位后验证
+--verify-pattern STR  验证匹配字符串
+--auto-detect         自动探测最佳复位方法
+--reset-log           查看复位日志
+--bootloader          进入 STM32 bootloader
 ```
 
 ## 设备复位
 
 | 方法 | 说明 | 适用场景 |
 |------|------|----------|
-| `dtr` | DTR → NRST | DTR 连接 NRST 的模块 |
-| `rts` | RTS → NRST | RTS 连接 NRST 的模块 |
-| `dtr_rts` | DTR+RTS 组合 | CH340/CP2102 等常见转接板 |
+| `dtr` | DTR → NRST | DTR 连接 NRST |
+| `rts` | RTS → NRST | RTS 连接 NRST |
+| `dtr_rts` | DTR+RTS 组合 | CH340/CP2102 |
 | `break` | BREAK 信号 | 支持 BREAK 的模块 |
-| `break_dtr` | BREAK+DTR | 某些特殊板子 |
-| `custom` | DTR+RTS 同时操作 | 自定义硬件 |
-| `bootloader` | BOOT0 拉高复位 | 进入 STM32 bootloader（0x7F 握手） |
+| `bootloader` | BOOT0 拉高复位 | 进入 STM32 bootloader |
 
 ## stm32-keil-workflow 集成
 
 自动集成 [stm32-keil-workflow](https://github.com/pjjuihj/stm32-skills) 工具链：
 
-| 集成功能 | 调用脚本 | 触发方式 |
-|---------|---------|---------|
-| 编译烧录 | `workflow.py --auto . --steps compile,flash` | `compile_and_flash()` |
-| 健康检查 | `health_check.py --project .` | `--health-check` |
-| 死机预防 | `brick_prevention.py --auto .` | `--brick-check` |
-| 错误总结 | `error_summary.py --auto . --text` | 编译失败自动调用 |
-| 错误追踪 | `error_tracker.py --search/--suggest/--record` | Python API |
-| 技术规范 | `tech_spec.py --auto . --text` | Python API |
-| 项目检测 | `detect_config.py --scan .` | `--auto .` |
+| 功能 | 触发方式 |
+|------|---------|
+| 编译烧录 | `compile_and_flash()` |
+| 健康检查 | `--health-check` |
+| 死机预防 | `--brick-check` |
+| 错误总结 | 编译失败自动调用 |
+| 错误追踪 | `search_error_history()` |
 
 ## 依赖
 
@@ -239,18 +208,15 @@ float filtered = median_filter_update(&mf, raw_value);
 |------|------|------|
 | Python 3.8+ | ✅ | 运行脚本 |
 | pyserial | ✅ | 串口通信 |
-| stm32-keil-workflow | ⚠️ | 编译烧录工作流（可选，无则跳过编译烧录） |
+| stm32-keil-workflow | ⚠️ | 编译烧录（可选，无则跳过） |
 
 ## 安全约束
 
 - ✅ 不全片擦除
 - ✅ 不写 Option Bytes
 - ✅ 不改读保护
-- ✅ 代码修改遵循最小改动原则
-- ✅ 烧录前必须验证固件
-- ✅ 代码注入前自动备份（`.bak`）
-- ✅ 复位日志可追溯（`--reset-log`）
-- ✅ 烧录前死机预防检查（`--brick-check`）
+- ✅ 烧录前死机预防检查
+- ✅ 复位日志可追溯
 
 ## 相关项目
 
