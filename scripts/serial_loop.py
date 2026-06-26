@@ -426,13 +426,14 @@ PERIODICITY_CONFIDENCE_THRESHOLD = 0.5  # 周期性置信度阈值
 # === 数据采集 ===
 
 def _process_line(line_buf: bytearray, start_time: float,
-                  filter_keyword: str = None) -> dict | None:
+                  filter_keyword: str = None, exclude_re=None) -> dict | None:
     """处理一行数据。
 
     Args:
         line_buf: 行缓冲区
         start_time: 开始时间
         filter_keyword: 过滤关键字
+        exclude_re: 排除模式的正则表达式对象
 
     Returns:
         数据条目，如果被过滤则返回 None
@@ -447,6 +448,10 @@ def _process_line(line_buf: bytearray, start_time: float,
 
     # 过滤关键字
     if filter_keyword and filter_keyword not in text:
+        return None
+
+    # 排除模式
+    if exclude_re and exclude_re.search(text):
         return None
 
     ts = time.time() - start_time
@@ -467,7 +472,7 @@ def _process_line(line_buf: bytearray, start_time: float,
 def collect_data(port: str, baud: int = 115200, duration: float = 10.0,
                  protocol: str = "text", retry_count: int = 3,
                  filter_keyword: str = None, send_cmds: list[str] = None,
-                 send_hex: str = None) -> dict:
+                 send_hex: str = None, exclude_pattern: str = None) -> dict:
     """采集串口数据。
 
     Args:
@@ -478,11 +483,20 @@ def collect_data(port: str, baud: int = 115200, duration: float = 10.0,
         retry_count: 重试次数
         filter_keyword: 过滤关键字
         send_cmds: 采集前发送的诊断命令列表
+        exclude_pattern: 排除匹配模式的行
 
     Returns:
         采集结果
     """
     print(f"数据采集: {port} @ {baud} bps, 时长 {duration}s, 协议 {protocol}")
+
+    # 编译排除模式
+    exclude_re = None
+    if exclude_pattern:
+        try:
+            exclude_re = re.compile(exclude_pattern)
+        except re.error as e:
+            print(f"  排除模式错误: {e}")
 
     # 重试机制
     ser = None
@@ -530,7 +544,7 @@ def collect_data(port: str, baud: int = 115200, duration: float = 10.0,
             data = ser.read(waiting if waiting > 0 else 1)
             if not data:
                 if line_buf:
-                    entry = _process_line(line_buf, start, filter_keyword)
+                    entry = _process_line(line_buf, start, filter_keyword, exclude_re)
                     if entry:
                         entries.append(entry)
                         if entry.get("build_info"):
@@ -541,7 +555,7 @@ def collect_data(port: str, baud: int = 115200, duration: float = 10.0,
 
             for b in data:
                 if b == ord("\n"):
-                    entry = _process_line(line_buf, start, filter_keyword)
+                    entry = _process_line(line_buf, start, filter_keyword, exclude_re)
                     if entry:
                         entries.append(entry)
                         if entry.get("build_info"):
@@ -3787,6 +3801,10 @@ def main() -> int:
                         help="编译前运行项目健康检查")
     parser.add_argument("--brick-check", action="store_true",
                         help="烧录前运行死机预防检查")
+    parser.add_argument("--filter", metavar="KEYWORD",
+                        help="过滤关键词（只显示包含关键词的行）")
+    parser.add_argument("--exclude", metavar="PATTERN",
+                        help="排除匹配模式的行（如 'I2C TX|OLED'）")
 
     args = parser.parse_args()
 
@@ -3828,7 +3846,8 @@ def main() -> int:
             parser.error("collect 模式需要 --port")
         result = collect_data(args.port, args.baud, args.duration, args.protocol,
                               send_cmds=args.send_cmd or None,
-                              send_hex=args.send_hex)
+                              send_hex=args.send_hex,
+                              exclude_pattern=args.exclude)
         if args.output:
             Path(args.output).write_text(
                 json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -3840,7 +3859,8 @@ def main() -> int:
         elif args.port:
             data = collect_data(args.port, args.baud, args.duration, args.protocol,
                                 send_cmds=args.send_cmd or None,
-                                send_hex=args.send_hex)
+                                send_hex=args.send_hex,
+                                exclude_pattern=args.exclude)
         else:
             parser.error("analyze 模式需要 --input 或 --port")
 
